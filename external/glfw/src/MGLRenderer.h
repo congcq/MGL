@@ -23,7 +23,14 @@
 
 #ifdef __OBJC__
 
+#include <TargetConditionals.h>
+#ifdef TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#define NSView UIView
+#define NSWindow UIWindow
+#else
 #import <Appkit/Appkit.h>
+#endif
 
 #ifndef __GLM_CONTEXT_
 #define __GLM_CONTEXT_
@@ -37,6 +44,7 @@ typedef struct GLMContextRec_t *GLMContext;
 
 - (id) initMGLRendererFromContext: (void *)glm_ctx andBindToWindow: (NSWindow *)window;
 - (id) createMGLRendererFromContext: (void *)glm_ctx andBindToWindow: (NSWindow *)window;
+- (void) createMGLRendererAndBindToContext: (GLMContext) glm_ctx view: (NSView *) view;
 
 @end
 
@@ -59,6 +67,7 @@ GLenum mtlPixelFormatForGLFormatType(GLenum gl_format, GLenum gl_type);
 extern "C" {
 #endif
 void* CppCreateMGLRendererFromContextAndBindToWindow (void *glm_ctx, void *window);
+void* CppCreateMGLRendererHeadless (void *glm_ctx);
 #ifdef __cplusplus
 }
 #endif

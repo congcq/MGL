@@ -18,7 +18,12 @@
  *
  */
 
+#include <TargetConditionals.h>
+#ifdef TARGET_OS_IPHONE
+#include "ios_mach_vm.h"
+#else
 #include <mach/mach_vm.h>
+#endif
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
 

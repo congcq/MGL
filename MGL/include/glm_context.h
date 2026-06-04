@@ -21,6 +21,12 @@
 #ifndef glm_context_h
 #define glm_context_h
 
+#include <TargetConditionals.h>
+#ifdef TARGET_OS_IPHONE
+#include "../../external/ANGLE/EGL/egl.h"
+#include "../../external/ANGLE/GLES3/gl3.h"
+#endif
+
 #include <stdio.h>
 #include <assert.h>
 
@@ -709,6 +715,12 @@ typedef struct GLMContextRec_t {
     PixelFormat pixel_format;
     PixelFormat depth_format;
     PixelFormat stencil_format;
+    
+#ifdef TARGET_OS_IPHONE
+    EGLDisplay eglDisplay;
+    EGLContext eglContext;
+    EGLSurface eglSurface;
+#endif
 
     BufferData  *temp_element_buffer;
 

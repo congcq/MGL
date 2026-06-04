@@ -23,7 +23,14 @@
 
 #ifdef __OBJC__
 
+#include <TargetConditionals.h>
+#ifdef TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#define NSView UIView
+#define NSWindow UIWindow
+#else
 #import <Appkit/Appkit.h>
+#endif
 
 #ifndef __GLM_CONTEXT_
 #define __GLM_CONTEXT_

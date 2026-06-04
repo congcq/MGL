@@ -25,7 +25,16 @@
 #import <simd/simd.h>
 #import <MetalKit/MetalKit.h>
 
+#include <TargetConditionals.h>
+#ifndef TARGET_OS_IPHONE
 #include <mach/mach_vm.h>
+#else
+#include "ios_mach_vm.h"
+#define NSRect CGRect
+#define NSSize CGSize
+#define NSView UIView
+#define NSMakeRect CGRectMake
+#endif
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
 
@@ -336,7 +345,11 @@ void logDirtyBits(GLMContext ctx)
 {
     MTLResourceOptions options;
 
+#ifdef TARGET_OS_IPHONE
+    options = MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeShared;
+#else
     options = MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeManaged;
+#endif
 
     // ways we will only write to this
     if ((ptr->storage_flags & GL_MAP_READ_BIT) == 0)
@@ -645,13 +658,17 @@ void logDirtyBits(GLMContext ctx)
         // contents in check for EVERY drawing operation
         if (ptr->access & GL_MAP_COHERENT_BIT)
         {
+#ifndef TARGET_OS_IPHONE
             [buffer didModifyRange: NSMakeRange(ptr->mapped_offset, ptr->mapped_length)];
+#endif
 
             ptr->data.dirty_bits = DIRTY_BUFFER_DATA;
         }
         else
         {
+#ifndef TARGET_OS_IPHONE
             [buffer didModifyRange: NSMakeRange(0, ptr->data.buffer_size)];
+#endif
 
             ptr->data.dirty_bits = 0;
         }
@@ -5130,8 +5147,9 @@ void mtlClearBuffer (GLMContext glm_ctx, GLuint type, GLbitfield mask)
 
     data = mtl_buffer.contents;
     memcpy(data+offset, ptr, size);
-
+#ifndef TARGET_OS_IPHONE
     [mtl_buffer didModifyRange:NSMakeRange(offset, size)];
+#endif
 }
 
 void mtlBufferSubData(GLMContext glm_ctx, Buffer *buf, size_t offset, size_t size, const void *ptr)
@@ -5156,8 +5174,9 @@ void mtlBufferSubData(GLMContext glm_ctx, Buffer *buf, size_t offset, size_t siz
     {
         return mtl_buffer.contents + offset;
     }
-
+#ifndef TARGET_OS_IPHONE
     [mtl_buffer didModifyRange:NSMakeRange(offset, size)];
+#endif
 
     return NULL;
 }
@@ -5175,7 +5194,9 @@ void *mtlMapUnmapBuffer(GLMContext glm_ctx, Buffer *buf, size_t offset, size_t s
 
     mtl_buffer = (__bridge id<MTLBuffer>)(buf->data.mtl_data);
 
+#ifndef TARGET_OS_IPHONE
     [mtl_buffer didModifyRange:NSMakeRange(offset, length)];
+#endif
 }
 
 void mtlFlushBufferRange(GLMContext glm_ctx, Buffer *buf, GLintptr offset, GLsizeiptr length)
@@ -6249,8 +6270,10 @@ void mtlMultiDrawElementsIndirect(GLMContext glm_ctx, GLenum mode, GLenum type, 
     NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(100, 100, 100, 100)];
     assert (view);
 
+#ifndef TARGET_OS_IPHONE
     [view setWantsLayer:YES];
     [window setContentView:view];
+#endif
     
     [renderer createMGLRendererAndBindToContext: glm_ctx view: view];
     
@@ -6268,8 +6291,10 @@ void mtlMultiDrawElementsIndirect(GLMContext glm_ctx, GLenum mode, GLenum type, 
     NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(100, 100, 100, 100)];
     assert (view);
 
+#ifndef TARGET_OS_IPHONE
     [view setWantsLayer:YES];
     [window setContentView:view];
+#endif
     
     [renderer createMGLRendererAndBindToContext: glm_ctx view: view];
     
@@ -6287,10 +6312,12 @@ void* CppCreateMGLRendererFromContextAndBindToWindow (void *glm_ctx, void *windo
     assert (w);
     NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(100, 100, 100, 100)];
     assert (view);
+#ifndef TARGET_OS_IPHONE
     [view setWantsLayer:YES];
     //assert(w.contentView);
     //[w.contentView addSubview:view];
     [w setContentView:view];
+#endif
     [renderer createMGLRendererAndBindToContext: glm_ctx view: view];
     return  (__bridge void *)(renderer);
 }
@@ -6304,7 +6331,10 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     // Create a dummy NSView for headless rendering
     NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(100, 100, 100, 100)];
     assert (view);
+
+#ifndef TARGET_OS_IPHONE
     [view setWantsLayer:YES];
+#endif
 
     [renderer createMGLRendererAndBindToContext: glm_ctx view: view];
     return  (__bridge void *)(renderer);
@@ -6354,13 +6384,14 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     }
 
     // Create command queue with virtualization-safe settings
-    MTLCommandQueueDescriptor *queueDescriptor = [[MTLCommandQueueDescriptor alloc] init];
+    //MTLCommandQueueDescriptor *queueDescriptor = [[MTLCommandQueueDescriptor alloc] init];
     if (isVirtualized) {
         NSLog(@"MGL INFO: VIRTUALIZED AGX - Enabling virtualization-safe command queue settings");
-        queueDescriptor.maxCommandBufferCount = 16;  // Limit concurrent buffers for virtualization safety
+        //queueDescriptor.maxCommandBufferCount = 16;  // Limit concurrent buffers for virtualization safety
     }
 
-    _commandQueue = [_device newCommandQueueWithDescriptor:queueDescriptor];
+    //_commandQueue = [_device newCommandQueueWithDescriptor:queueDescriptor];
+    _commandQueue = [_device newCommandQueue];
     if (!_commandQueue) {
         NSLog(@"MGL ERROR: Failed to create Metal command queue");
         return;
@@ -6387,15 +6418,23 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     _layer.presentsWithTransaction = NO;
 
     // AGX-safe scale factor handling
+#ifdef TARGET_OS_IPHONE
+    int scaleFactor = [[UIScreen mainScreen] scale];
+#else
     int scaleFactor = [[NSScreen mainScreen] backingScaleFactor];
+#endif
     [_layer setContentsScale: scaleFactor];
 
     // AGX-safe layer attachment
+#ifdef TARGET_OS_IPHONE
+    [[_view layer] addSublayer:_layer];
+#else
     if ([_view layer]) {
         [[_view layer] addSublayer: _layer];
     } else {
         [_view setLayer: _layer];
     }
+#endif
 
     mglDrawBuffer(glm_ctx, GL_FRONT);
 
@@ -6991,25 +7030,39 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
             return 8; // 64-bit formats need 8-byte alignment
 
         // 128-bit formats
+#ifdef TARGET_OS_IPHONE
+        case MTLPixelFormatASTC_4x4_LDR:
+        case MTLPixelFormatASTC_4x4_sRGB:
+        case MTLPixelFormatASTC_5x5_LDR:
+        case MTLPixelFormatASTC_5x5_sRGB:
+        case MTLPixelFormatASTC_6x6_LDR:
+        case MTLPixelFormatASTC_6x6_sRGB:
+        case MTLPixelFormatASTC_8x8_LDR:
+        case MTLPixelFormatASTC_8x8_sRGB:
+        case MTLPixelFormatASTC_10x10_LDR:
+        case MTLPixelFormatASTC_10x10_sRGB:
+        case MTLPixelFormatASTC_12x12_LDR:
+        case MTLPixelFormatASTC_12x12_sRGB:
+            return 16;
+#else
         case MTLPixelFormatBC1_RGBA:
         case MTLPixelFormatBC1_RGBA_sRGB:
         case MTLPixelFormatBC2_RGBA:
         case MTLPixelFormatBC2_RGBA_sRGB:
         case MTLPixelFormatBC3_RGBA:
         case MTLPixelFormatBC3_RGBA_sRGB:
-            return 16; // BC compressed formats need 16-byte alignment
+        case MTLPixelFormatBC6H_RGBFloat:
+        case MTLPixelFormatBC6H_RGBUfloat:
+        case MTLPixelFormatBC7_RGBAUnorm:
+        case MTLPixelFormatBC7_RGBAUnorm_sRGB:
+            return 16;
 
         case MTLPixelFormatBC4_RUnorm:
         case MTLPixelFormatBC4_RSnorm:
         case MTLPixelFormatBC5_RGUnorm:
         case MTLPixelFormatBC5_RGSnorm:
-            return 8; // BC4/BC5 need 8-byte alignment
-
-        case MTLPixelFormatBC6H_RGBFloat:
-        case MTLPixelFormatBC6H_RGBUfloat:
-        case MTLPixelFormatBC7_RGBAUnorm:
-        case MTLPixelFormatBC7_RGBAUnorm_sRGB:
-            return 16; // BC6/BC7 need 16-byte alignment
+            return 8;
+#endif
 
         default:
             // For unknown formats, check if we're running on Apple Silicon AGX

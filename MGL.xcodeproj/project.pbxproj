@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		F47D25DC2FD14AE300CBE704 /* ios_mach_vm.h in Headers */ = {isa = PBXBuildFile; fileRef = F47D25DB2FD14AD800CBE704 /* ios_mach_vm.h */; };
+		F47D25DD2FD14AE300CBE704 /* ios_mach_vm.h in Headers */ = {isa = PBXBuildFile; fileRef = F47D25DB2FD14AD800CBE704 /* ios_mach_vm.h */; };
 		FF2DC2602D2C9A830040B838 /* uniforms.c in Sources */ = {isa = PBXBuildFile; fileRef = FF2DC25F2D2C9A830040B838 /* uniforms.c */; };
 		FF2DC2612D2C9A830040B838 /* uniforms.c in Sources */ = {isa = PBXBuildFile; fileRef = FF2DC25F2D2C9A830040B838 /* uniforms.c */; };
 		FF2DC2632D2C9B040040B838 /* programs.h in Headers */ = {isa = PBXBuildFile; fileRef = FF2DC2622D2C9B040040B838 /* programs.h */; };
@@ -328,6 +330,8 @@
 		DFC728FA2894855E00990595 /* libSPIRV-Tools-shared.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = "libSPIRV-Tools-shared.dylib"; path = "external/SPIRV-Tools/build/source/libSPIRV-Tools-shared.dylib"; sourceTree = "<group>"; };
 		DFC728FC289485A000990595 /* libSPIRV-Tools.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "libSPIRV-Tools.a"; path = "external/SPIRV-Tools/build/source/libSPIRV-Tools.a"; sourceTree = "<group>"; };
 		DFC729002894933400990595 /* test_mgl_glfw.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = test_mgl_glfw.entitlements; sourceTree = SOURCE_ROOT; };
+		F47D25DB2FD14AD800CBE704 /* ios_mach_vm.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ios_mach_vm.h; sourceTree = "<group>"; };
+		F47D25DE2FD19B9800CBE704 /* CMakeLists.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = CMakeLists.txt; sourceTree = "<group>"; };
 		FF2DC2592D2C64B20040B838 /* MetalGL.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = MetalGL.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		FF2DC25F2D2C9A830040B838 /* uniforms.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = uniforms.c; sourceTree = "<group>"; };
 		FF2DC2622D2C9B040040B838 /* programs.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = programs.h; sourceTree = "<group>"; };
@@ -566,6 +570,7 @@
 				FF7B7A9727728C1D00C2028F /* glm_dispatch.c */,
 				FF7B7A9527728C1D00C2028F /* glm_context.c */,
 				FF7B7A8E27728C1D00C2028F /* utils.c */,
+				F47D25DB2FD14AD800CBE704 /* ios_mach_vm.h */,
 				FF7B7A8F27728C1D00C2028F /* error.c */,
 				FF7B7A8827728C1D00C2028F /* get.c */,
 				FFA1EB702782851500EEE5AD /* compute.c */,
@@ -618,6 +623,7 @@
 			children = (
 				FF2DC2652D2DCA490040B838 /* TestImages */,
 				FF86AEA92794DD0A00C51A88 /* README.md */,
+				F47D25DE2FD19B9800CBE704 /* CMakeLists.txt */,
 				FF6C4D5F2D2375E600945F18 /* Makefile */,
 				FF7B77E727710FE100C2028F /* GL */,
 				FF7B784927714BE700C2028F /* spec_parser */,
@@ -742,6 +748,7 @@
 				FF7B7AC927728C3100C2028F /* error.h in Headers */,
 				FF7B7AD027728C3100C2028F /* hash_table.h in Headers */,
 				FF7B7ACD27728C3100C2028F /* shaders.h in Headers */,
+				F47D25DC2FD14AE300CBE704 /* ios_mach_vm.h in Headers */,
 				FF7B7ACE27728C3100C2028F /* glm_context.h in Headers */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -766,6 +773,7 @@
 				FFD4EE492F14585E0023B6C3 /* error.h in Headers */,
 				FFD4EE4A2F14585E0023B6C3 /* hash_table.h in Headers */,
 				FFD4EE4B2F14585E0023B6C3 /* shaders.h in Headers */,
+				F47D25DD2FD14AE300CBE704 /* ios_mach_vm.h in Headers */,
 				FFD4EE4C2F14585E0023B6C3 /* glm_context.h in Headers */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1429,7 +1437,7 @@
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
-				SDKROOT = macosx;
+				SDKROOT = iphoneos;
 			};
 			name = Debug;
 		};
@@ -1471,6 +1479,7 @@
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = "compiler-default";
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -1483,7 +1492,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 10.15;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
-				SDKROOT = macosx;
+				SDKROOT = iphoneos;
 			};
 			name = Release;
 		};

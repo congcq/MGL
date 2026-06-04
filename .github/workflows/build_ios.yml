@@ -1,0 +1,31 @@
+name: Build MGL for iOS
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+  name: build MGL
+  runs-on: macos-latest
+  steps:
+    - name: Install dependencies
+      run: brew install make
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Build
+      run: gmake build
+
+    - name: Upload MGL-Core
+      uses: actions/upload-artifact@v4
+      with:
+        name: libmgl-core
+        path: build/libmgl_core.dylib
+
+    - name: Upload MGL-ES
+      uses: actions/upload-artifact@v4
+      with:
+        name: libmgl-es
+        path: build/libmgl_es.dylib

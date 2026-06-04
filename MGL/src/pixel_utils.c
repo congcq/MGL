@@ -19,6 +19,7 @@
  */
  
 #include <Availability.h>
+#include <TargetConditionals.h>
 
 #include "pixel_utils.h"
 #include "glm_context.h"
@@ -2425,8 +2426,13 @@ MTLPixelFormat mtlPixelFormatForGLFormatType(GLenum gl_format, GLenum gl_type)
                 case GL_RG: return MTLPixelFormatRG32Float;
                 case GL_RGBA: return MTLPixelFormatRGBA32Float;
                 case GL_DEPTH_COMPONENT: return MTLPixelFormatDepth32Float;
-                case GL_DEPTH_STENCIL: return MTLPixelFormatDepth24Unorm_Stencil8;
-
+                case GL_DEPTH_STENCIL:
+#ifdef TARGET_OS_IPHONE
+                    return MTLPixelFormatDepth32Float_Stencil8;
+#else
+                    return MTLPixelFormatDepth24Unorm_Stencil8;
+#endif
+                    
                 default:
                     return 0;
             }

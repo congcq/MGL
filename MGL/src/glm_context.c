@@ -33,6 +33,7 @@
 #include "error.h"
 
 extern void getMacOSDefaults(GLMContext glm_ctx);
+extern void getiOSDefaults(GLMContext glm_ctx);
 extern void init_dispatch(GLMContext ctx);
 
 GLMContext _ctx = NULL;
@@ -111,7 +112,11 @@ GLMContext createGLMContext(GLenum format, GLenum type,
     }
 
     // use a CGL context to read guestimates of gl params for installed GPU
+#ifndef TARGET_OS_IPHONE
     getMacOSDefaults(ctx);
+#else
+    getiOSDefaults(ctx);
+#endif
 
     assert(STATE(max_color_attachments) <= MAX_COLOR_ATTACHMENTS);
     assert(STATE(max_vertex_attribs) <= MAX_ATTRIBS);
@@ -335,7 +340,16 @@ void destroyGLMContext(GLMContext ctx)
         return;
 
     fprintf(stderr, "MGL INFO: Destroying GLMContext\n");
-
+    
+#ifdef TARGET_OS_IPHONE
+    if (ctx->eglContext) {
+        eglMakeCurrent(ctx->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(ctx->eglDisplay, ctx->eglSurface);
+        eglDestroyContext(ctx->eglDisplay, ctx->eglContext);
+        eglTerminate(ctx->eglDisplay);
+    }
+    free (ctx);
+#endif
     // CRITICAL FIX: Implement basic cleanup of context resources to prevent major memory leaks
     // Clean up critical hash tables to prevent memory corruption
 
