@@ -8,7 +8,6 @@ CMAKE_BUILD_TYPE := "release"
 JOBS             := $(sysctl -n hw.ncpu)
 	
 build_external:
-	echo "Use $(JOBS) CPU core for build"
 	cd external; \
 	./clone_external.sh; \
 	./build_external.sh
