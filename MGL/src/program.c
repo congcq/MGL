@@ -374,7 +374,7 @@ void addShadersToProgram(GLMContext ctx, Program *pptr, glslang_program_t *glsl_
     }
 }
 
-int locationGetAttribLocation(GLMContext ctx, Program *ptr, const GLChar *name)
+int localGetAttribLocation(GLMContext ctx, Program *ptr, const GLChar *name)
 {
     for (int i = 0; i < MAX_ATTRIBS && ptr->attribute_location_list[i]; i++) {
         if (!strcmp(ptr->attribute_location_list[i], name))
