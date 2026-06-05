@@ -149,6 +149,17 @@ void mglBindVertexArray(GLMContext ctx, GLuint array)
         STATE(vao) = ptr;
         STATE(dirty_bits) |= DIRTY_VAO;
     }
+
+    if (ptr && ptr->element_buffer != 0)
+    {
+        GLint eboIndex = bufferIndexFromTarget(ctx, GL_ELEMENT_ARRAY_BUFFER);
+        STATE(buffers[eboIndex]) = findBuffer(ctx, ptr->element_buffer);
+    }
+    else if (ptr && ptr->element_buffer == 0)
+    {
+        GLint eboIndex = bufferIndexFromTarget(ctx, GL_ELEMENT_ARRAY_BUFFER);
+        STATE(buffers[eboIndex]) = NULL;
+    }
 }
 
 void mglDeleteVertexArrays(GLMContext ctx, GLsizei n, const GLuint *arrays)
