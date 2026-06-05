@@ -5,7 +5,7 @@ SDKPATH := $(shell xcrun --sdk iphoneos --show-sdk-path)
 
 WORKINGDIR       := "build"
 CMAKE_BUILD_TYPE := "release"
-JOBS             := 6
+JOBS             := $(sysctl -n hw.ncpu)
 	
 build_external:
 	cd external; \
