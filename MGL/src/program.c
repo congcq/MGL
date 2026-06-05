@@ -551,7 +551,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
         int attribCount = 0;
         for (i = 0; i < count; i++)
         {
-            if (res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT || res_type == SPVC_RESOURCE_TYPE_STATE_OUTPUT)
+            if (res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT || res_type == SPVC_RESOURCE_TYPE_STAGE_OUTPUT)
             {
                 int location = localGetAttribLocation(ctx, ptr, list[i].name);
                 if (location == 0)
@@ -562,7 +562,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
                 {
                     attribCount = location+1;
                 }
-                spvc_compiler_set_decoration(compiler_msl, list[i].id, SpvcDecorationLocation, location);
+                spvc_compiler_set_decoration(compiler_msl, list[i].id, SpvDecorationLocation, location);
             }
             DEBUG_PRINT("res_type: %s ID: %u, BaseTypeID: %u, TypeID: %u, Name: %s ", res_name[res_type], list[i].id, list[i].base_type_id, list[i].type_id,
                    list[i].name);
@@ -619,7 +619,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
     }
 
     spvc_compiler_compile(compiler_msl, &result);
-    //DEBUG_PRINT("\n%s\n", result);
+    DEBUG_PRINT("\n%s\n", result);
 
     str_ret = strdup(result);
 
