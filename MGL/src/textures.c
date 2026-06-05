@@ -1109,13 +1109,9 @@ bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
             level, internalformat, width, height, depth, format, type);
 
     fprintf(stderr, "MGL: createTextureLevel checkpoint 1 - tex->immutable_storage=%d\n", tex->immutable_storage);
-    if (internalformat == 0)
+    if (internalformat == format)
     {
         internalformat = internalFormatForGLFormatType(format, type);
-        if (internalformat == 0)
-        {
-            ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
-        }
     }
     
     // all the levels are created on a tex storage call.. if we get here we should just assert

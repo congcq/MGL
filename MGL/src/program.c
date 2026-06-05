@@ -374,6 +374,19 @@ void addShadersToProgram(GLMContext ctx, Program *pptr, glslang_program_t *glsl_
     }
 }
 
+int locationGetAttribLocation(GLMContext ctx, Program *ptr, const GLChar *name)
+{
+    for (int i = 0; i < MAX_ATTRIBS && ptr->attribute_location_list[i]; i++) {
+        if (!strcmp(ptr->attribute_location_list[i], name))
+        {
+            return i;
+        }
+    }
+
+    DEBUG_PRINT("localGetAttribsLocation(program=%p, name=%s) not found, defaulting to 0\n", ptr, name);
+    return 0;
+}
+
 char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
 {
     const SpvId *spirv;
@@ -535,8 +548,22 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
             ERROR_RETURN(GL_OUT_OF_MEMORY);
         }
 
+        int attribCount = 0;
         for (i = 0; i < count; i++)
         {
+            if (res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT || res_type == SPVC_RESOURCE_TYPE_STATE_OUTPUT)
+            {
+                int location = localGetAttribLocation(ctx, ptr, list[i].name);
+                if (location == 0)
+                {
+                    ptr->attribute_location_list[location = attribCount++] = list[i].name;
+                }
+                else
+                {
+                    attribCount = location+1;
+                }
+                spvc_compiler_set_decoration(compiler_msl, list[i].id, SpvcDecorationLocation, location);
+            }
             DEBUG_PRINT("res_type: %s ID: %u, BaseTypeID: %u, TypeID: %u, Name: %s ", res_name[res_type], list[i].id, list[i].base_type_id, list[i].type_id,
                    list[i].name);
             
@@ -592,7 +619,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
     }
 
     spvc_compiler_compile(compiler_msl, &result);
-    DEBUG_PRINT("\n%s\n", result);
+    //DEBUG_PRINT("\n%s\n", result);
 
     str_ret = strdup(result);
 
@@ -797,10 +824,18 @@ void mglUseProgram(GLMContext ctx, GLuint program)
 
 void mglBindAttribLocation(GLMContext ctx, GLuint program, GLuint index, const GLchar *name)
 {
-    // Unimplemented function
-    // CRITICAL FIX: Handle error gracefully instead of crashing
+    if (isProgram(ctx, program) == GL_FALSE)
+    {
         fprintf(stderr, "MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
         STATE(error) = GL_INVALID_OPERATION;
+    }
+
+    Program *ptr;
+
+    ptr = getProgram(ctx, program);
+    assert(program);
+
+    ptr->attribute_location_list[index] = strdup(name);
 }
 
 void mglGetActiveAttrib(GLMContext ctx, GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name)

@@ -450,7 +450,7 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     }
 
     /* Set glslang options to auto-assign locations for legacy shaders */
-    int options = GLSLANG_SHADER_VULKAN_RULES_RELAXED;
+    int options = GLSLANG_SHADER_AUTO_MAP_BINDINGS | GLSLANG_SHADER_AUTO_MAP_LOCATIONS | GLSLANG_SHADER_VULKAN_RULES_RELAXED;
 
     /* Detect if this is a legacy GLSL shader that needs location auto-assignment */
     int shader_version = 330; /* Default */
@@ -591,7 +591,7 @@ void mglGetShaderiv(GLMContext ctx, GLuint shader, GLenum pname, GLint *params)
             break;
 
         case GL_INFO_LOG_LENGTH:
-            *params = (GLint)strlen(ptr->log);
+            *params = ptr->log ? (GLint)strlen(ptr->log) : 0;
             break;
 
         case GL_SHADER_SOURCE_LENGTH:

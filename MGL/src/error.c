@@ -50,6 +50,6 @@ void error_func(GLMContext ctx, const char *func, GLenum error)
     ctx->state.error = error;
 
     /* Temporarily disabled to allow QEMU to continue despite errors */
-    // if (ctx->assert_on_error)
-    //     assert(0);
+    if (ctx->assert_on_error)
+        abort();
 }
