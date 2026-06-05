@@ -1,4 +1,5 @@
 SHELL := /bin/bash
+$(VERBOSE).SILENT:
 
 SDKPATH := $(shell xcrun --sdk iphoneos --show-sdk-path)
 
@@ -6,9 +7,12 @@ WORKINGDIR       := "build"
 CMAKE_BUILD_TYPE := "release"
 JOBS             := 6
 	
+build_external:
+	cd external; \
+	./clone_external.sh; \
+	./build_external.sh
 
-build:
-	cd external && ./clone_external.sh && ./build_external.sh
+build: build_external
 	mkdir -p $(WORKINGDIR)
 	cd $(WORKINGDIR) && cmake .. \
 		-DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
@@ -29,6 +33,4 @@ build:
 clean:
 	rm -rf build external/*/build
 
-.PHONY: clean build 
-
--include $(deps)
+.PHONY: clean build_external build
