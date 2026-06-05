@@ -791,7 +791,7 @@ void mglBufferData(GLMContext ctx, GLenum target, GLsizeiptr size, const void *d
         // fprintf(stderr, "MGL WARNING: glBufferData called on immutable buffer %d\n", ptr->name);
     }
 
-    initBufferData(ctx, ptr, size, data, false);
+    initBufferData(ctx, ptr, size, data, true);
 
     // init fields local to buffer data
     ptr->index = index;
@@ -823,7 +823,7 @@ void mglNamedBufferData(GLMContext ctx, GLuint buffer, GLsizeiptr size, const vo
         ERROR_RETURN(GL_INVALID_OPERATION);
     }
 
-    initBufferData(ctx, ptr, size, data,false);
+    initBufferData(ctx, ptr, size, data, true);
 
     // init fields local to buffer data
     ptr->usage = usage;

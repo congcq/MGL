@@ -21,12 +21,6 @@
 #ifndef glm_context_h
 #define glm_context_h
 
-#include <TargetConditionals.h>
-#ifdef TARGET_OS_IPHONE
-#include "../../external/ANGLE/EGL/egl.h"
-#include "../../external/ANGLE/GLES3/gl3.h"
-#endif
-
 #include <stdio.h>
 #include <assert.h>
 

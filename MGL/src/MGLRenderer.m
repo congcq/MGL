@@ -4177,6 +4177,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         }
         else if (ctx->state.dirty_bits & DIRTY_RENDER_STATE)
         {
+            // updateDirtyBaseBufferList binds new mtl buffers or updates old ones
+            RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list]);
+            RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list]);
+/*
             if (_currentRenderEncoder == NULL)
             {
                 RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
@@ -4186,7 +4190,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
             // updateCurrentRenderEncoder will update the renderstate outside of creating a new one
             [self updateCurrentRenderEncoder];
-
+*/
             ctx->state.dirty_bits &= ~DIRTY_RENDER_STATE;
         }
 

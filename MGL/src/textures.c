@@ -722,7 +722,7 @@ bool checkTexLevelParams(GLMContext ctx, Texture *tex, GLint level, GLuint inter
         }
     }
 
-    if (checkInternalFormatForMetal(ctx, internalformat))
+    if (!checkInternalFormatForMetal(ctx, internalformat))
     {
         return false;
     }
@@ -1105,6 +1105,19 @@ bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x
 
 bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLboolean is_array, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, void *pixels, GLboolean proxy)
 {
+    fprintf(stderr, "MGL: createTextureLevel called - level=%d, internalformat=0x%x, width=%d, height=%d, depth=%d, format=0x%x, type=0x%x\n",
+            level, internalformat, width, height, depth, format, type);
+
+    fprintf(stderr, "MGL: createTextureLevel checkpoint 1 - tex->immutable_storage=%d\n", tex->immutable_storage);
+    if (internalformat == 0)
+    {
+        internalformat = internalFormatForGLFormatType(format, type);
+        if (internalformat == 0)
+        {
+            ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
+        }
+    }
+    
     // all the levels are created on a tex storage call.. if we get here we should just assert
     if (tex->immutable_storage)
     {

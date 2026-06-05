@@ -18,6 +18,12 @@
  *
  */
 
+#include <TargetConditionals.h>
+#ifdef TARGET_OS_IPHONE
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+#endif
+
 
 #include <stdlib.h>
 #include <string.h>
