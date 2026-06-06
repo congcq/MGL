@@ -540,15 +540,6 @@ void mglBindBuffer(GLMContext ctx, GLenum target, GLuint buffer)
         STATE(buffers[index]) = ptr;
         STATE(dirty_bits) |= DIRTY_BUFFER;
     }
-
-    if (target == GL_ELEMENT_ARRAY_BUFFER)
-    {
-        VertexArray *vao = ctx->state.vao;
-        if (vao)
-        {
-            vao->element_buffer = buffer; // bind buffer id to VAO
-        }
-    }
 }
 
 void mglBindBufferBase(GLMContext ctx, GLenum target, GLuint index, GLuint buffer)
