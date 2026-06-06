@@ -619,7 +619,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
     }
 
     spvc_compiler_compile(compiler_msl, &result);
-    DEBUG_PRINT("\n%s\n", result);
+    // DEBUG_PRINT("\n%s\n", result);
 
     str_ret = strdup(result);
 
@@ -683,7 +683,9 @@ bool linkAndCompileProgramToMetal(GLMContext ctx, Program *pptr, int stage)
         fprintf(stderr, "MGL Error: glslang_program_get_info_log:\n%s\n", glslang_program_get_info_log(glsl_program));
         fprintf(stderr, "MGL Error: glslang_program_get_info_debug_log:\n%s\n", glslang_program_get_info_debug_log(glsl_program));
 
+        glslang_program_delete(glsl_program);
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return false;
     }
 
     // generate SPIVR
@@ -695,7 +697,9 @@ bool linkAndCompileProgramToMetal(GLMContext ctx, Program *pptr, int stage)
     {
         DEBUG_PRINT("%s\n", glslang_program_SPIRV_get_messages(glsl_program));
 
+        glslang_program_delete(glsl_program);
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return false;
     }
 
     // save SPIRV code
@@ -707,14 +711,18 @@ bool linkAndCompileProgramToMetal(GLMContext ctx, Program *pptr, int stage)
     // Check if size * sizeof(unsigned) would overflow size_t
     if (pptr->spirv[stage].size > SIZE_MAX / sizeof(unsigned)) {
         fprintf(stderr, "MGL SECURITY ERROR: SPIRV size %zu would cause allocation overflow\n", pptr->spirv[stage].size);
+        glslang_program_delete(glsl_program);
         ERROR_RETURN(GL_OUT_OF_MEMORY);
+        return false;
     }
 
     size_t alloc_size = pptr->spirv[stage].size * sizeof(unsigned);
     pptr->spirv[stage].ir = (unsigned int *)malloc(alloc_size);
     if (!pptr->spirv[stage].ir) {
         fprintf(stderr, "MGL SECURITY ERROR: Failed to allocate %zu bytes for SPIRV\n", alloc_size);
+        glslang_program_delete(glsl_program);
         ERROR_RETURN(GL_OUT_OF_MEMORY);
+        return false;
     }
     fprintf(stderr, "MGL DEBUG: Getting SPIRV IR\n");
     glslang_program_SPIRV_get(glsl_program, pptr->spirv[stage].ir);
@@ -727,13 +735,15 @@ bool linkAndCompileProgramToMetal(GLMContext ctx, Program *pptr, int stage)
     // ERROR_CHECK_RETURN(pptr->spirv[stage].msl_str, GL_INVALID_OPERATION);
     if (pptr->spirv[stage].msl_str == NULL) {
         fprintf(stderr, "MGL Error: parseSPIRVShaderToMetal failed for stage %d\n", stage);
+        free(pptr->spirv[stage].ir);
+        pptr->spirv[stage].ir = NULL;
+        glslang_program_delete(glsl_program);
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return false;
     }
 
     pptr->linked_glsl_program = glsl_program;
     pptr->dirty_bits |= DIRTY_PROGRAM;
-
-    glslang_program_delete(glsl_program);
 
     return true;
 }

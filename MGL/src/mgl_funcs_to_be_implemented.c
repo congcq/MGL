@@ -10,6 +10,8 @@
 
 #include "mgl.h"
 
+#define assert(i) printf("Unimplemented function %s\n", __func__)
+
 // Forward declarations for transform feedback functions from program.c
 TransformFeedback *newTransformFeedback(GLMContext ctx, GLuint name);
 TransformFeedback *findTransformFeedback(GLMContext ctx, GLuint name);

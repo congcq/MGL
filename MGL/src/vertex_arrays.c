@@ -385,7 +385,7 @@ void mglVertexAttribIPointer(GLMContext ctx, GLuint index, GLint size, GLenum ty
     {
         Buffer *ptr;
 
-        ptr = ctx->state.vao->attrib[index].buffer;
+        ptr = STATE(buffers[_ARRAY_BUFFER]);
 
         ERROR_CHECK_RETURN(ptr, GL_INVALID_OPERATION);
     }
@@ -398,13 +398,8 @@ void mglVertexAttribIPointer(GLMContext ctx, GLuint index, GLint size, GLenum ty
         case GL_UNSIGNED_SHORT:
         case GL_INT:
         case GL_UNSIGNED_INT:
-        case GL_HALF_FLOAT:
-        case GL_FLOAT:
-        case GL_DOUBLE:
-        case GL_FIXED:
         case GL_INT_2_10_10_10_REV:
         case GL_UNSIGNED_INT_2_10_10_10_REV:
-        case GL_UNSIGNED_INT_10F_11F_11F_REV:
             break;
 
         default:
@@ -429,7 +424,7 @@ void mglVertexAttribLPointer(GLMContext ctx, GLuint index, GLint size, GLenum ty
     {
         Buffer *ptr;
 
-        ptr = ctx->state.vao->attrib[index].buffer;
+        ptr = STATE(buffers[_ARRAY_BUFFER]);
 
         ERROR_CHECK_RETURN(ptr, GL_INVALID_OPERATION);
     }

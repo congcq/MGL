@@ -540,6 +540,16 @@ void mglBindBuffer(GLMContext ctx, GLenum target, GLuint buffer)
         STATE(buffers[index]) = ptr;
         STATE(dirty_bits) |= DIRTY_BUFFER;
     }
+
+    // If binding element array buffer and a VAO is active, update VAO's element buffer
+    if (target == GL_ELEMENT_ARRAY_BUFFER && STATE(vao) != NULL)
+    {
+        if (STATE(vao)->element_array.buffer != ptr)
+        {
+            STATE(vao)->element_array.buffer = ptr;
+            STATE(vao)->dirty_bits |= DIRTY_VAO;
+        }
+    }
 }
 
 void mglBindBufferBase(GLMContext ctx, GLenum target, GLuint index, GLuint buffer)

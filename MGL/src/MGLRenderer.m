@@ -37,6 +37,45 @@
 #endif
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
+#include <stdlib.h>
+
+static void *mglAllocateAlignedMemory(NSUInteger alignment, size_t size)
+{
+    if (size == 0)
+        return NULL;
+
+    if (alignment < sizeof(void *))
+        alignment = sizeof(void *);
+
+    // Ensure alignment is a power of two
+    if (alignment & (alignment - 1)) {
+        NSUInteger power = 1;
+        while (power < alignment) {
+            power <<= 1;
+        }
+        alignment = power;
+    }
+
+    size_t adjustedSize = size;
+    if (adjustedSize % alignment != 0) {
+        adjustedSize = ((adjustedSize + alignment - 1) / alignment) * alignment;
+    }
+
+    void *ptr = NULL;
+    int err = posix_memalign(&ptr, alignment, adjustedSize);
+    if (err != 0 || ptr == NULL) {
+        ptr = calloc(1, adjustedSize);
+        if (ptr) {
+            NSLog(@"MGL WARNING: posix_memalign failed (%d), falling back to calloc for %zu bytes (alignment=%lu)", err, adjustedSize, (unsigned long)alignment);
+        }
+    }
+
+    if (!ptr) {
+        NSLog(@"MGL ERROR: Failed to allocate aligned memory for texture fill (%zu bytes, alignment=%lu)", adjustedSize, (unsigned long)alignment);
+    }
+
+    return ptr;
+}
 
 // Header shared between C code here, which executes Metal API commands, and .metal files, which
 // uses these types as inputs to the shaders.
@@ -901,6 +940,12 @@ void logDirtyBits(GLMContext ctx)
     BOOL mipmapped;
     BOOL is_array;
 
+    if (tex->num_levels == 0 || tex->width == 0 || tex->height == 0 || tex->depth == 0) {
+        NSLog(@"MGL WARNING: Texture incomplete or zero-sized (name=%u target=0x%x width=%u height=%u depth=%u num_levels=%u mipmap_levels=%u) in createMTLTextureFromGLTexture - skipping creation",
+              tex->name, tex->target, tex->width, tex->height, tex->depth, tex->num_levels, tex->mipmap_levels);
+        return nil;
+    }
+
     num_faces = 1;
     is_array = false;
 
@@ -968,10 +1013,8 @@ void logDirtyBits(GLMContext ctx)
     }
     else
     {
-        // not sure how we got here
-        // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
-            return NULL;
+        // Texture has zero levels or an invalid level count; treat it as incomplete
+        NSLog(@"MGL WARNING: Invalid texture level count (%u) in createMTLTextureFromGLTexture - skipping texture creation", tex->num_levels);
         return NULL;
     }
     tex->complete = true;
@@ -1157,7 +1200,7 @@ void logDirtyBits(GLMContext ctx)
                         if (addr % 256 != 0 || alignedBytesPerRow != bytesPerRow) {
                             // Data is not aligned OR bytesPerRow needs alignment - allocate aligned buffer and copy row by row
                             NSUInteger alignedSize = ((bytesPerImage + alignment - 1) / alignment) * alignment;
-                            void *alignedData = aligned_alloc(alignment, alignedSize);
+                            void *alignedData = mglAllocateAlignedMemory(alignment, alignedSize);
 
                             if (alignedData) {
                                 // Copy data row by row to handle bytesPerRow alignment
@@ -1278,7 +1321,7 @@ void logDirtyBits(GLMContext ctx)
                                 if (addr % alignment != 0 || alignedBytesPerRow != bytesPerRow) {
                                     // Data is not aligned OR bytesPerRow needs alignment - allocate aligned buffer and copy
                                     NSUInteger alignedSize = ((bytesPerImage + alignment - 1) / alignment) * alignment;
-                                    void *alignedData = aligned_alloc(alignment, alignedSize);
+                                    void *alignedData = mglAllocateAlignedMemory(alignment, alignedSize);
 
                                     if (alignedData) {
                                         // Copy data with row alignment
@@ -1371,7 +1414,7 @@ void logDirtyBits(GLMContext ctx)
                             if (addr % alignment != 0 || alignedBytesPerRow != bytesPerRow) {
                                 // Data is not aligned OR bytesPerRow needs alignment - allocate aligned buffer and copy
                                 NSUInteger alignedSize = ((bytesPerImage + alignment - 1) / alignment) * alignment;
-                                void *alignedData = aligned_alloc(alignment, alignedSize);
+                                void *alignedData = mglAllocateAlignedMemory(alignment, alignedSize);
 
                                 if (alignedData) {
                                     // Copy data row by row to handle bytesPerRow alignment
@@ -1495,7 +1538,7 @@ void logDirtyBits(GLMContext ctx)
                 NSLog(@"MGL WARNING: Skipping texture fill due to excessive size: %lu bytes", (unsigned long)dataSize);
             } else {
                 // Allocate aligned black data and clear the texture
-                void *blackData = aligned_alloc(alignment, dataSize);
+                void *blackData = mglAllocateAlignedMemory(alignment, dataSize);
                 if (blackData) {
                     // CRITICAL SECURITY FIX: Comprehensive validation to prevent Metal driver crashes
                     memset(blackData, 0, dataSize); // Clear to black
@@ -1603,7 +1646,7 @@ void logDirtyBits(GLMContext ctx)
 
                     // Create properly aligned texture data buffer
                     NSUInteger fillSize = properBytesPerRow * properRegion.size.height;
-                    uint8_t *properData = (uint8_t *)calloc(fillSize, 1);
+                    uint8_t *properData = (uint8_t *)mglAllocateAlignedMemory(64, fillSize);
 
                     if (properData) {
                         // Initialize with safe texture data (transparent black with alpha = 0)
@@ -1934,12 +1977,15 @@ void logDirtyBits(GLMContext ctx)
 // AGX-SAFE Fallback texture creation for GPU error recovery scenarios
 - (id<MTLTexture>) createFallbackMTLTexture:(Texture *) tex
 {
-    NSLog(@"MGL AGX: Creating emergency fallback texture (size: %dx%dx%d)", tex->width, tex->height, tex->depth);
+    NSUInteger fallbackWidth = MAX(tex->width, 1);
+    NSUInteger fallbackHeight = MAX(tex->height, 1);
+
+    NSLog(@"MGL AGX: Creating emergency fallback texture (requested: %dx%dx%d, fallback: %lux%lu)", tex->width, tex->height, tex->depth, (unsigned long)fallbackWidth, (unsigned long)fallbackHeight);
 
     @try {
         MTLTextureDescriptor *fallbackDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                                                    width:MAX(tex->width, 1)
-                                                                                                   height:MAX(tex->height, 1)
+                                                                                                    width:fallbackWidth
+                                                                                                   height:fallbackHeight
                                                                                                 mipmapped:NO];
         fallbackDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
         fallbackDesc.storageMode = MTLStorageModeShared;
@@ -2633,10 +2679,18 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     id<MTLLibrary> library;
     __autoreleasing NSError *error = nil;
 
-    library = [_device newLibraryWithSource: [NSString stringWithUTF8String: str] options: nil error: &error];
+    // Work around SPIRV-Cross address-space mismatch for scalar uniforms passed by reference.
+    NSString *source = [NSString stringWithUTF8String: str];
+    source = [source stringByReplacingOccurrencesOfString:@"thread const float&" withString:@"float"];
+    source = [source stringByReplacingOccurrencesOfString:@"thread const int&" withString:@"int"];
+    source = [source stringByReplacingOccurrencesOfString:@"thread const uint&" withString:@"uint"];
+    source = [source stringByReplacingOccurrencesOfString:@"thread const bool&" withString:@"bool"];
+    source = [source stringByReplacingOccurrencesOfString:@"thread const half&" withString:@"half"];
+
+    library = [_device newLibraryWithSource:source options:nil error:&error];
     if(!library) {
         NSLog(@"MGL ERROR: Failed to compile shader: %@ ", [error localizedDescription] );
-        NSLog(@"MGL ERROR: Shader source: %s", str);
+        NSLog(@"MGL ERROR: Shader source: %@", source);
         // Return nil instead of asserting - caller must handle this gracefully
         return nil;
     }
@@ -4099,7 +4153,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 {
                     // Validate framebuffer pointer is within reasonable bounds
                     uintptr_t fb_addr = (uintptr_t)ctx->state.framebuffer;
-                    if (fb_addr < 0x1000 || fb_addr > 0x100000000) {
+                    if (fb_addr < 0x1000 || fb_addr > 0x100000000000ULL) {
                         NSLog(@"MGL ERROR: Invalid framebuffer pointer detected: 0x%lx", fb_addr);
                         return false;
                     }
