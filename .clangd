@@ -1,0 +1,21 @@
+CompileFlags:
+  Add: [
+    "-target", "arm64-apple-ios14.0",
+    "-fblocks",
+    
+    "-DMGL_GL_CORE",
+
+    "-isystem", "/home/congcq/theos/include",
+    "-isystem", "/home/congcq/theos/vendor/include",
+    "-isystem", "/home/congcq/theos/sdks/iPhoneOS14.5.sdk/usr/include",
+    "-F/home/congcq/theos/sdks/iPhoneOS14.5.sdk/System/Library/Frameworks",
+
+    "-I", "/home/congcq/Desktop/MGL/MGL/include",
+    "-I", "/home/congcq/Desktop/MGL/MGL/include/GL",
+    "-I", "/home/congcq/Desktop/MGL/MGL/src",
+    
+    "-I", "/home/congcq/Desktop/MGL/external/ANGLE",
+    "-I", "/home/congcq/Desktop/MGL/external/SPIRV-Cross",
+    "-I", "/home/congcq/Desktop/MGL/external/SPIRV-Tools/include",
+    "-I", "/home/congcq/Desktop/MGL/external/glslang/glslang/Include"
+  ]

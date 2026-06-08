@@ -21,14 +21,9 @@
 #ifndef glm_context_h
 #define glm_context_h
 
-#include <TargetConditionals.h>
-#ifdef TARGET_OS_IPHONE
-#include <EGL/egl.h>
-#include <GLES3/gl3.h>
-#endif
-
 #include <stdio.h>
 #include <assert.h>
+#include <stdint.h>
 
 #include <mach/vm_types.h>
 #include <glslang_c_interface.h>
@@ -36,6 +31,7 @@
 
 #include "glm_dispatch.h"
 
+#include "draw_command.h"
 #include "hash_table.h"
 
 // defines above set sizes in glm_params
@@ -67,10 +63,12 @@
 #define VAO_STATE(_val_)   ctx->state.vao->_val_
 #define VAO_ATTRIB_STATE(_index_) ctx->state.vao->attrib[_index_]
 
-#define ERROR_RETURN(_type_) ctx->error_func(ctx, __FUNCTION__, _type_)
-#define ERROR_RETURN_VALUE(_type_, _val_) ctx->error_func(ctx, __FUNCTION__, _type_); return _val_
-#define ERROR_CHECK_RETURN(_expr_, _type_) if ((_expr_) == false) {ctx->error_func(ctx, __FUNCTION__, _type_);}
-#define ERROR_CHECK_RETURN_VALUE(_expr_, _type_, _val_) if ((_expr_) == false) {ctx->error_func(ctx, __FUNCTION__, _type_); return _val_;}
+void mglDispatchError(GLMContext ctx, const char *func, GLenum type);
+
+#define ERROR_RETURN(_type_) do { mglDispatchError(ctx, __FUNCTION__, (_type_)); } while(0)
+#define ERROR_RETURN_VALUE(_type_, _val_) do { mglDispatchError(ctx, __FUNCTION__, (_type_)); return (_val_); } while(0)
+#define ERROR_CHECK_RETURN(_expr_, _type_) do { if ((_expr_) == false) { mglDispatchError(ctx, __FUNCTION__, (_type_)); return; } } while(0)
+#define ERROR_CHECK_RETURN_VALUE(_expr_, _type_, _val_) do { if ((_expr_) == false) { mglDispatchError(ctx, __FUNCTION__, (_type_)); return (_val_); } } while(0)
 
 enum {
     _TEXTURE_BUFFER = 0, // duplicate of _TEXTURE_BUFFER_TARGET
@@ -194,6 +192,16 @@ typedef struct BufferData_t {
 #define BUFFER_IMMUTABLE_STORAGE_FLAG   0x1
 #define BUFFER_MAP_PERSISTENT_BIT       (BUFFER_IMMUTABLE_STORAGE_FLAG << 1)
 
+typedef enum MGLBufferInitSource_t {
+    kInitNone = 0,
+    kInitBufferDataNull,
+    kInitBufferDataCopy,
+    kInitBufferSubData,
+    kInitCopyBufferSubData,
+    kInitReadPixels,
+    kInitMapWrite
+} MGLBufferInitSource;
+
 typedef struct Buffer_t {
     GLuint name;
     GLenum target;
@@ -208,6 +216,17 @@ typedef struct Buffer_t {
     GLsizeiptr mapped_offset;
     GLsizeiptr mapped_length;
     BufferData data;
+    GLboolean has_initialized_data;
+    GLboolean ever_written;
+    GLintptr written_min;
+    GLintptr written_max; // exclusive byte offset, -1 when unknown/unwritten
+    MGLBufferInitSource last_init_source;
+    GLintptr last_write_offset;
+    GLsizeiptr last_write_size;
+    const void *last_write_src_ptr;
+    uint64_t last_write_src_hash;
+    void *mapped_ptr;
+    GLboolean transient_batch_buffer;
 } Buffer;
 
 typedef struct BufferBaseTarget_t {
@@ -218,6 +237,7 @@ typedef struct BufferBaseTarget_t {
 } BufferBaseTarget;
 
 #define MAX_BINDABLE_BUFFERS    16
+#define MGL_MAX_VERTEX_ATTRIB_BINDINGS MAX_VERTEX_BUFFER_BINDINGS
 typedef struct BufferBase_t {
     BufferBaseTarget    buffers[MAX_BINDABLE_BUFFERS];
 } BufferBase;
@@ -248,6 +268,17 @@ typedef struct TextureParameter_t {
     void *mtl_data;
 } TextureParameter;
 
+typedef enum MGLTexLevelInitSource_t {
+    kTexInitNone = 0,
+    kTexImageNull,
+    kTexImageCopy,
+    kTexImagePBO,
+    kTexSubImageCPU,
+    kTexSubImagePBO,
+    kTexRenderTargetWrite,
+    kTexMetalFill
+} MGLTexLevelInitSource;
+
 typedef struct TextureLevel_t {
     GLboolean complete;
     GLuint width;
@@ -257,6 +288,13 @@ typedef struct TextureLevel_t {
     GLuint mtl_format;
     size_t  data_size;
     vm_address_t data;
+    GLboolean has_initialized_data;
+    GLboolean ever_written;
+    GLboolean suspicious_zero_upload;
+    GLuint last_init_source;
+    size_t last_upload_size;
+    const void *last_src_ptr;
+    uint64_t last_src_hash;
 } TextureLevel;
 
 enum {
@@ -306,11 +344,23 @@ typedef struct Texture_t {
     GLuint mipmap_levels;
     TextureFace faces[6];
     void    *mtl_data;
+    void    *mtl_gl_sampled_data;
+    GLuint  mtl_gl_sampled_width;
+    GLuint  mtl_gl_sampled_height;
+    GLuint  mtl_gl_sampled_format;
+    GLuint  mtl_gl_sampled_write_version;
+    GLuint  mtl_render_target_write_version;
+    Buffer  *texture_buffer;
+    GLintptr texture_buffer_offset;
+    GLsizeiptr texture_buffer_size;
+    char debug_label[128];
 } Texture;
 
 typedef struct TextureUnit_t {
     Texture *textures[_MAX_TEXTURE_TYPES];
 } TextureUnit;
+
+#define MGL_RECENT_SAMPLED_2D_HISTORY 8
 
 typedef struct ImageUnit_t {
     GLuint unit;
@@ -335,9 +385,12 @@ typedef struct VertexAttrib_t {
     GLuint  size;
     GLenum  type;
     GLuint  normalized;
+    GLuint  integer;
+    GLuint  long_attribute;
     GLuint  stride;
     GLuint  divisor;
     GLintptr  relativeoffset;
+    GLintptr  binding_offset;
     GLuint  buffer_bindingindex;
 } VertexAttrib;
 
@@ -348,13 +401,18 @@ typedef struct VertexElementArray_t {
     const void *ptr;
 } VertexElementArray;
 
+#define MGL_VAO_MAGIC 0x56414F31u
+
 typedef struct VertexArray_t {
+    uint32_t magic;
     GLuint dirty_bits;
     unsigned name;
     unsigned enabled_attribs;
+    BufferBinding bindings[MGL_MAX_VERTEX_ATTRIB_BINDINGS];
     VertexAttrib attrib[MAX_ATTRIBS];
     VertexElementArray element_array;
     void *mtl_data;
+    GLboolean transient_batch_vao;
 } VertexArray;
 
 typedef struct Shader_t {
@@ -373,6 +431,12 @@ typedef struct Shader_t {
     struct {
         void *function;
         void *library;
+        void *zero_to_one_function;
+        void *zero_to_one_library;
+        void *upper_left_function;
+        void *upper_left_library;
+        void *upper_left_zero_to_one_function;
+        void *upper_left_zero_to_one_library;
     } mtl_data;
 } Shader;
 
@@ -392,8 +456,18 @@ typedef struct SpirvResource_t {
     GLuint  type_id;
     const char *name;
     GLuint  set;
+    /* GL client binding point. For UBOs, glUniformBlockBinding updates this. */
+    GLuint  gl_binding;
+    /* Metal argument slot parsed from generated MSL after resource repair. */
     GLuint  binding;
     GLuint  location;
+    GLint   uniform_location;
+    GLint   sampler_unit;
+    GLboolean sampler_unit_explicit;
+    size_t  required_size;
+    GLuint  image_dim;
+    GLuint  image_arrayed;
+    GLuint  image_multisampled;
 } SpirvResource;
 
 typedef struct SpirvResourceList_t {
@@ -404,14 +478,26 @@ typedef struct SpirvResourceList_t {
 typedef struct BufferMap_t {
     GLuint      buffer_base_index;
     GLuint      attribute_mask;
+    GLuint      resource_type;
+    GLuint      resource_index;
+    GLuint      metal_binding_index;
+    GLboolean   has_metal_binding;
     Buffer      *buf;
     GLintptr    offset;
+    GLsizeiptr  size;
 } BufferMap;
 
 typedef struct BufferMapList_t {
     GLuint      count;
     BufferMap   buffers[MAX_MAPPED_BUFFERS];
 } BufferMapList;
+
+typedef struct ProxyTextureQueryState_t {
+    GLint width;
+    GLint height;
+    GLint depth;
+    GLint internalformat;
+} ProxyTextureQueryState;
 
 typedef struct Program_t {
     GLuint dirty_bits;
@@ -422,12 +508,30 @@ typedef struct Program_t {
     glslang_program_t *linked_glsl_program;
     Spirv spirv[_MAX_SHADER_TYPES];
     SpirvResourceList spirv_resources_list[_MAX_SHADER_TYPES][_MAX_SPIRV_RES];
-    const char *attribute_location_list[MAX_ATTRIBS];
     struct {
         unsigned x, y, z;
     } local_workgroup_size;
+    GLint sampler_units[TEXTURE_UNITS];
+    GLint sampler_units_by_stage[_MAX_SHADER_TYPES][TEXTURE_UNITS];
+    GLboolean sampler_units_explicit[TEXTURE_UNITS];
+    GLboolean sampler_units_explicit_by_stage[_MAX_SHADER_TYPES][TEXTURE_UNITS];
+    BufferBaseTarget plain_uniform_buffers[MAX_BINDABLE_BUFFERS];
+    char *attrib_location_names[MAX_ATTRIBS];
+    GLboolean attrib_location_name_owned[MAX_ATTRIBS];
     void *mtl_data;
 } Program;
+
+GLint mglProgramActiveUniformCount(Program *program);
+GLint mglProgramActiveUniformMaxNameLength(Program *program);
+SpirvResource *mglProgramActiveUniformAt(Program *program, GLuint index, int *stage_out, int *res_type_out);
+GLint mglProgramActiveUniformIndexByName(Program *program, const GLchar *name);
+GLint mglProgramActiveUniformGLType(const SpirvResource *res, int res_type);
+GLint mglProgramActiveUniformSize(const SpirvResource *res, int res_type);
+GLsizei mglProgramActiveUniformNameLength(const SpirvResource *res);
+void mglProgramCopyActiveUniformName(const SpirvResource *res, GLsizei bufSize, GLsizei *length, GLchar *name);
+GLboolean mglProgramPointerUsableForName(GLMContext ctx, Program *program, GLuint expectedName);
+void mglRetainProgramReference(GLMContext ctx, Program *program);
+void mglReleaseProgramReference(GLMContext ctx, Program *program);
 
 typedef struct ProgramPipeline_t {
     GLuint name;
@@ -456,6 +560,7 @@ typedef struct FBOAttachment_t {
     GLuint texture;
     GLuint level;
     GLuint layer;
+    GLboolean layered;
     GLbitfield clear_bitmask;
     GLfloat clear_color[4];
     union {
@@ -468,6 +573,10 @@ typedef struct Framebuffer_t {
     GLuint dirty_bits;
     GLuint  name;
     GLbitfield color_attachment_bitfield;
+    GLuint draw_buffer;
+    GLsizei draw_buffer_count;
+    GLenum draw_buffers[MAX_COLOR_ATTACHMENTS];
+    GLuint read_buffer;
     FBOAttachment color_attachments[MAX_COLOR_ATTACHMENTS];
     FBOAttachment depth;
     FBOAttachment stencil;
@@ -553,7 +662,12 @@ typedef struct {
     GLuint dirty_bits;
 
     // clear request clear_bitmask from glClear to Metal
+    // NOTE: clear_bitmask is deprecated - clears are recorded per-FBO/attachment
     GLbitfield  clear_bitmask;
+
+    // Default framebuffer clear state (used when framebuffer == NULL)
+    GLbitfield  default_fbo_clear_bitmask;
+    GLfloat     default_clear_color[4];
 
     // opengl state
 
@@ -561,14 +675,27 @@ typedef struct {
 
     GLenum error;   // glGetError
 
-    GLuint draw_buffer; // GL_DRAW_BUFFER
+    GLuint draw_buffer; // GL_DRAW_BUFFER / GL_DRAW_BUFFER0
+    GLsizei draw_buffer_count;
+    GLenum draw_buffers[MAX_COLOR_ATTACHMENTS];
     GLuint read_buffer; // GL_READ_BUFFER
+    GLuint default_draw_buffer;
+    GLsizei default_draw_buffer_count;
+    GLenum default_draw_buffers[MAX_COLOR_ATTACHMENTS];
+    GLuint default_read_buffer;
     GLuint max_color_attachments; // GL_MAX_COLOR_ATTACHMENTS
     GLuint max_vertex_attribs; // GL_MAX_VERTEX_ATTRIBS
-    GLuint viewport[4]; // GL_VIEWPORT
+    GLint viewport[4]; // GL_VIEWPORT
+    GLfloat viewport_array[MGL_MAX_VIEWPORTS][4];
+    GLint scissor_box_array[MGL_MAX_VIEWPORTS][4];
+    GLdouble depth_range_array[MGL_MAX_VIEWPORTS][2];
     GLfloat color_clear_value[4]; // GL_COLOR_CLEAR_VALUE
 
     Buffer *buffers[MAX_BINDABLE_BUFFERS];
+    // Compatibility slot for VAO 0 element-array binding.
+    Buffer *default_vao_element_array_buffer;
+    // Proxy texture probe state per texture target/index (capability query, no allocation).
+    ProxyTextureQueryState proxy_texture_query[_MAX_TEXTURE_TYPES];
 
     VertexArray *vao;
     Texture     *tex;
@@ -580,6 +707,8 @@ typedef struct {
     unsigned    active_texture_mask[4];
     Texture     *active_textures[TEXTURE_UNITS];
     TextureUnit texture_units[TEXTURE_UNITS];
+    Texture     *last_sampled_2d_textures[TEXTURE_UNITS];
+    Texture     *recent_sampled_2d_textures[TEXTURE_UNITS][MGL_RECENT_SAMPLED_2D_HISTORY];
     Sampler     *texture_samplers[TEXTURE_UNITS];
     ImageUnit   image_units[TEXTURE_UNITS];
 
@@ -598,6 +727,7 @@ typedef struct {
 
     Shader      *shaders[_MAX_SHADER_TYPES];
     Program     *program;
+    GLuint      program_name;
     ProgramPipeline *program_pipeline;
     TransformFeedback *transform_feedback;
 
@@ -644,6 +774,8 @@ struct GLMMetalFuncs {
 
     void (*mtlFlush)(GLMContext glm_ctx, bool finish);
     void (*mtlSwapBuffers)(GLMContext glm_ctx);
+    void (*mtlFlushDrawBuffer)(GLMContext glm_ctx);
+    void (*mtlInvalidateRenderPass)(GLMContext glm_ctx);
     
     void (*mtlClearBuffer)(GLMContext glm_ctx, GLuint type, GLbitfield mask);
     void (*mtlBlitFramebuffer)(GLMContext ctx, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
@@ -654,11 +786,13 @@ struct GLMMetalFuncs {
     void (*mtlFlushBufferRange)(GLMContext glm_ctx, Buffer *buf, GLintptr offset, GLsizeiptr length);
 
     void (*mtlReadDrawable)(GLMContext glm_ctx, void *pixelBytes, GLuint bytesPerRow, GLuint bytesPerImage, GLint x, GLint y, GLsizei width, GLsizei height);
-    void (*mtlGetTexImage)(GLMContext glm_ctx, Texture *tex, void *pixelBytes, GLuint bytesPerRow, GLuint bytesPerImage, GLint x, GLint y, GLsizei width, GLsizei height, GLuint level, GLuint slice);
+    void (*mtlReadDepthPixels)(GLMContext glm_ctx, void *pixelBytes, GLuint bytesPerRow, GLuint bytesPerImage, GLint x, GLint y, GLsizei width, GLsizei height);
+    void (*mtlGetTexImage)(GLMContext glm_ctx, Texture *tex, void *pixelBytes, GLuint bytesPerRow, GLuint bytesPerImage, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLuint level, GLuint slice);
 
     void (*mtlGenerateMipmaps)(GLMContext glm_ctx, Texture *tex);
     void (*mtlTexSubImage)(GLMContext glm_ctx, Texture *tex, Buffer *buf, size_t src_offset, size_t src_pitch, size_t src_image_size, size_t src_size, GLuint slice, GLuint level, size_t width, size_t height, size_t depth, size_t xoffset, size_t yoffset, size_t zoffset);
-    void (*mtlCopyTexSubImage)(GLMContext glm_ctx, Texture *tex, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height);
+    bool (*mtlTexSubImageBytes)(GLMContext glm_ctx, Texture *tex, const void *bytes, size_t bytes_size, size_t src_offset, size_t src_pitch, size_t src_image_size, GLuint slice, GLuint level, size_t width, size_t height, size_t depth, size_t xoffset, size_t yoffset, size_t zoffset);
+    void (*mtlCopyTexSubImage)(GLMContext glm_ctx, Texture *tex, GLuint slice, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height);
     void (*mtlCopyImageSubData)(GLMContext glm_ctx, Texture *srcTex, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ, Texture *dstTex, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei width, GLsizei height, GLsizei depth);
 
     // draw arrays / elements
@@ -716,14 +850,14 @@ typedef struct GLMContextRec_t {
     PixelFormat pixel_format;
     PixelFormat depth_format;
     PixelFormat stencil_format;
-    
-#ifdef TARGET_OS_IPHONE
-    EGLDisplay eglDisplay;
-    EGLContext eglContext;
-    EGLSurface eglSurface;
-#endif
+    GLboolean   default_framebuffer_srgb_capable;
+    GLuint      default_framebuffer_linear_mtl_pixel_format;
+    GLuint      default_framebuffer_srgb_mtl_pixel_format;
 
     BufferData  *temp_element_buffer;
+
+    MGLCommandBuffer draw_command_buffer;
+    bool            draw_defer_enabled;
 
     void (* error_func)(GLMContext ctx, const char *func, GLenum type);
 } GLMContextRec;
@@ -733,9 +867,11 @@ GLMContext createGLMContext(GLenum format, GLenum type,
                             GLenum depth_format, GLenum depth_type,
                             GLenum stencil_format, GLenum stencil_type);
 
+void MGLsetDefaultFramebufferSRGBCapable(GLMContext ctx, GLboolean capable);
 void mgl_lazy_init(void);
 
 void MGLsetCurrentContext(GLMContext ctx);
+void destroyGLMContext(GLMContext ctx);
 
 enum {
     MGL_PIXEL_FORMAT,
@@ -758,6 +894,11 @@ void MGLget(GLMContext ctx, GLenum param, GLuint *data);
 bool pixelConvertToInternalFormat(GLMContext ctx, GLenum internalformat, GLenum format, GLenum type, const void *src, void *dst, size_t len);
 
 bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLboolean is_array, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, void *pixels, GLboolean proxy);
+
+Framebuffer *findFrameBuffer(GLMContext ctx, GLuint framebuffer);
+GLboolean mglFramebufferPrimaryColorSize(GLMContext ctx, Framebuffer *fbo, GLuint *outWidth, GLuint *outHeight);
+void mglSetViewportToFramebufferSize(GLMContext ctx, Framebuffer *fbo);
+void mglAssignDrawFramebuffer(GLMContext ctx, Framebuffer *fbo);
 
 
 #ifdef __cplusplus

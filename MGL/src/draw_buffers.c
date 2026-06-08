@@ -26,8 +26,173 @@
 #endif
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
+#include <stdint.h>
 
 #include "glm_context.h"
+#include "draw_command.h"
+#include "mgl_safety.h"
+
+static void mglInitVertexArrayDefaultsForDraw(VertexArray *vao)
+{
+    if (!vao)
+        return;
+
+    for (int i = 0; i < MAX_ATTRIBS; i++)
+    {
+        vao->attrib[i].size = 4;
+        vao->attrib[i].type = GL_FLOAT;
+        vao->attrib[i].integer = 0;
+        vao->attrib[i].long_attribute = 0;
+        vao->attrib[i].stride = 0;
+        vao->attrib[i].divisor = 0;
+        vao->attrib[i].relativeoffset = 0;
+        vao->attrib[i].binding_offset = 0;
+        vao->attrib[i].buffer_bindingindex = 0;
+        vao->attrib[i].buffer = NULL;
+    }
+
+    for (int i = 0; i < MGL_MAX_VERTEX_ATTRIB_BINDINGS; i++)
+    {
+        vao->bindings[i].buffer = NULL;
+        vao->bindings[i].offset = 0;
+        vao->bindings[i].stride = 16;
+        vao->bindings[i].divisor = 0;
+    }
+}
+
+static Buffer *mglResolveVertexAttribBufferForDraw(VertexArray *vao, GLuint attrib)
+{
+    if (!vao || attrib >= MAX_ATTRIBS)
+        return NULL;
+
+    VertexAttrib *a = &vao->attrib[attrib];
+    if (a->buffer_bindingindex < MGL_MAX_VERTEX_ATTRIB_BINDINGS &&
+        vao->bindings[a->buffer_bindingindex].buffer) {
+        return vao->bindings[a->buffer_bindingindex].buffer;
+    }
+
+    return a->buffer;
+}
+
+static VertexArray *mglGetOrCreateDefaultVAO(GLMContext ctx)
+{
+    VertexArray *vao;
+
+    if (!ctx)
+        return NULL;
+
+    vao = (VertexArray *)searchHashTable(&STATE(vao_table), 0);
+    if (vao &&
+        (!mglObjectPointerLooksPlausible(vao) ||
+         !mglPointerRangeIsReadable(vao, sizeof(*vao)) ||
+         vao->magic != MGL_VAO_MAGIC))
+    {
+        fprintf(stderr, "MGL WARNING: default VAO entry is invalid (%p), recreating VAO 0\n", (void *)vao);
+        deleteHashElement(&STATE(vao_table), 0);
+        vao = NULL;
+    }
+
+    if (!vao)
+    {
+        vao = (VertexArray *)calloc(1, sizeof(VertexArray));
+        if (!vao)
+            return NULL;
+
+        vao->magic = MGL_VAO_MAGIC;
+        vao->name = 0;
+
+        mglInitVertexArrayDefaultsForDraw(vao);
+
+        insertHashElement(&STATE(vao_table), 0, vao);
+    }
+
+    // Keep VAO0 EBO compatibility slot synchronized.
+    vao->element_array.buffer = STATE(default_vao_element_array_buffer);
+
+    return vao;
+}
+
+static bool should_log_throttled(uint64_t *counter, uint64_t burst_limit, uint64_t every_n)
+{
+    (*counter)++;
+    return (*counter <= burst_limit) || ((*counter % every_n) == 0);
+}
+
+static void mglDropCurrentVAO(GLMContext ctx)
+{
+    if (!ctx)
+        return;
+
+    ctx->state.vao = NULL;
+    STATE(buffers[_ELEMENT_ARRAY_BUFFER]) = STATE(default_vao_element_array_buffer);
+    STATE_VAR(element_array_buffer_binding) =
+        STATE(default_vao_element_array_buffer) ? STATE(default_vao_element_array_buffer)->name : 0;
+    STATE(dirty_bits) |= DIRTY_VAO;
+}
+
+static VertexArray *mglGetSafeCurrentVAO(GLMContext ctx, const char *caller)
+{
+    VertexArray *vao;
+
+    if (!ctx)
+        return NULL;
+
+    vao = ctx->state.vao;
+    if (!vao)
+        return NULL;
+
+    if (!mglObjectPointerLooksPlausible(vao) ||
+        !mglHashTableContainsData(&STATE(vao_table), vao) ||
+        !mglPointerRangeIsReadable(vao, sizeof(*vao)))
+    {
+        static uint64_t invalid_vao_count = 0;
+        if (should_log_throttled(&invalid_vao_count, 8, 1000)) {
+            fprintf(stderr,
+                    "MGL WARNING: %s: dropping invalid current VAO pointer %p\n",
+                    caller ? caller : "draw",
+                    (void *)vao);
+        }
+        mglDropCurrentVAO(ctx);
+        return NULL;
+    }
+
+    if (vao->magic != MGL_VAO_MAGIC)
+    {
+        fprintf(stderr, "MGL WARNING: %s: current VAO magic invalid vao=%p magic=0x%x\n",
+                caller ? caller : "draw",
+                (void *)vao,
+                vao->magic);
+        mglDropCurrentVAO(ctx);
+        return NULL;
+    }
+
+    return vao;
+}
+
+static bool should_skip_indexed_draw_no_element_buffer(GLMContext ctx, const char *caller)
+{
+    static uint64_t missing_element_buffer_count = 0;
+    VertexArray *vao = mglGetSafeCurrentVAO(ctx, caller);
+
+    if (!vao || vao->element_array.buffer) {
+        return false;
+    }
+
+    if (should_log_throttled(&missing_element_buffer_count, 8, 1000)) {
+        fprintf(stderr,
+                "MGL Warning: %s: missing element buffer, skipping indexed draw (occurrence=%llu)\n",
+                caller,
+                (unsigned long long)missing_element_buffer_count);
+    }
+
+    return true;
+}
+
+static Buffer *mglCurrentElementBuffer(GLMContext ctx, const char *caller)
+{
+    VertexArray *vao = mglGetSafeCurrentVAO(ctx, caller);
+    return vao ? vao->element_array.buffer : NULL;
+}
 
 bool check_draw_modes(GLenum mode)
 {
@@ -57,6 +222,7 @@ bool check_element_type(GLenum mode)
 {
     switch(mode)
     {
+        case GL_UNSIGNED_BYTE:
         case GL_UNSIGNED_SHORT:
         case GL_UNSIGNED_INT:
             return true;
@@ -69,8 +235,10 @@ bool processVAO(GLMContext ctx)
 {
     VertexArray *vao;
 
-    vao = ctx->state.vao;
-    assert(vao);
+    vao = mglGetSafeCurrentVAO(ctx, __FUNCTION__);
+    if (!vao) {
+        ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
+    }
 
     if (vao->dirty_bits & DIRTY_VAO_BUFFER_BASE)
     {
@@ -79,7 +247,7 @@ bool processVAO(GLMContext ctx)
         {
             if (vao->enabled_attribs & (0x1 << i))
             {
-                if (vao->attrib[i].buffer == NULL)
+                if (mglResolveVertexAttribBufferForDraw(vao, (GLuint)i) == NULL)
                 {
                     // no buffer bound to active attrib...
                     return false;
@@ -87,7 +255,7 @@ bool processVAO(GLMContext ctx)
             }
 
             // early out
-            if ((VAO_STATE(enabled_attribs) >> (i+1)) == 0)
+            if ((vao->enabled_attribs >> (i+1)) == 0)
                 break;
         }
 
@@ -100,16 +268,32 @@ bool processVAO(GLMContext ctx)
 
 bool validate_vao(GLMContext ctx, bool uses_elements)
 {
-    if (!VAO()) {
-        fprintf(stderr, "MGL Error: validate_vao: VAO is NULL\n");
+    VertexArray *vao;
+
+    if (!ctx)
         return false;
+
+    vao = mglGetSafeCurrentVAO(ctx, __FUNCTION__);
+    if (!vao) {
+        VertexArray *default_vao = mglGetOrCreateDefaultVAO(ctx);
+        if (!default_vao) {
+            fprintf(stderr, "MGL Error: validate_vao: VAO is NULL and default VAO creation failed\n");
+            return false;
+        }
+
+        ctx->state.vao = default_vao;
+        STATE(buffers[_ELEMENT_ARRAY_BUFFER]) = default_vao->element_array.buffer;
+        STATE_VAR(element_array_buffer_binding) =
+            default_vao->element_array.buffer ? default_vao->element_array.buffer->name : 0;
+        fprintf(stderr, "MGL INFO: validate_vao: rebound to default VAO\n");
+        vao = default_vao;
     }
 
     // no attribs enabled..
     // if (VAO_STATE(enabled_attribs) == 0)
     //    return false;
 
-    if (ctx->state.vao->dirty_bits)
+    if (vao->dirty_bits)
     {
         if (!processVAO(ctx)) {
             fprintf(stderr, "MGL Error: validate_vao: processVAO failed\n");
@@ -119,16 +303,20 @@ bool validate_vao(GLMContext ctx, bool uses_elements)
 
     unsigned int enabled_attribs;
 
-    enabled_attribs = ctx->state.vao->enabled_attribs;
+    enabled_attribs = vao->enabled_attribs;
 
     int i=0;
     do
     {
         if (enabled_attribs & 0x1)
         {
-            // mapped buffers cannot be used during draw calls
-            if (VAO_ATTRIB_STATE(i).buffer->mapped) {
-                fprintf(stderr, "MGL Error: validate_vao: attrib %d buffer mapped\n", i);
+            // Mapped buffers cannot be used during draw calls unless
+            // mapped persistently (GL_MAP_PERSISTENT_BIT), which GL 4.5
+            // explicitly allows for simultaneous mapping and rendering.
+            Buffer *attrib_buffer = mglResolveVertexAttribBufferForDraw(vao, (GLuint)i);
+            if (!attrib_buffer || (attrib_buffer->mapped &&
+                !(attrib_buffer->access_flags & GL_MAP_PERSISTENT_BIT))) {
+                fprintf(stderr, "MGL Error: validate_vao: attrib %d buffer mapped (non-persistent)\n", i);
                 return false;
             }
         }
@@ -139,8 +327,7 @@ bool validate_vao(GLMContext ctx, bool uses_elements)
 
     if (uses_elements)
     {
-        if (!ctx->state.vao->element_array.buffer) {
-            fprintf(stderr, "MGL Error: validate_vao: element buffer missing\n");
+        if (!vao->element_array.buffer) {
             return false;
         }
     }
@@ -150,8 +337,30 @@ bool validate_vao(GLMContext ctx, bool uses_elements)
 
 bool validate_program(GLMContext ctx)
 {
-    if (ctx->state.program) {
-        if (ctx->state.program->shader_slots[_GEOMETRY_SHADER])
+    Program *program = ctx ? ctx->state.program : NULL;
+
+    if (program) {
+        GLuint expectedName = 0u;
+        GLboolean pointerReadable =
+            mglObjectPointerLooksPlausible(program) &&
+            mglPointerRangeIsReadable(program, sizeof(*program));
+        if (pointerReadable) {
+            expectedName = ctx->state.program_name ? ctx->state.program_name : program->name;
+        }
+
+        if (!pointerReadable ||
+            !mglProgramPointerUsableForName(ctx, program, expectedName)) {
+            fprintf(stderr, "MGL WARNING: validate_program dropping invalid cached program pointer %p\n",
+                    (void *)program);
+            ctx->state.program = NULL;
+            ctx->state.program_name = 0;
+            ctx->state.var.current_program = 0;
+            program = NULL;
+        }
+    }
+
+    if (program) {
+        if (program->shader_slots[_GEOMETRY_SHADER])
         {
             fprintf(stderr, "MGL Error: validate_program: geometry shader present (unsupported)\n");
             return false;
@@ -166,6 +375,9 @@ GLsizei getTypeSize(GLenum type)
 {
     switch(type)
     {
+        case GL_UNSIGNED_BYTE:
+            return sizeof(unsigned char);
+
         case GL_UNSIGNED_SHORT:
             return sizeof(unsigned short);
 
@@ -173,7 +385,7 @@ GLsizei getTypeSize(GLenum type)
             return sizeof(unsigned int);
     }
 
-    assert(0);
+    fprintf(stderr, "MGL WARNING: unsupported index type 0x%x\n", type);
 
     return 0;
 }
@@ -211,6 +423,18 @@ void mglDrawArrays(GLMContext ctx, GLenum mode, GLint first, GLsizei count)
         return;
     }
 
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ARRAYS;
+        cmd.mode = mode;
+        cmd.first = first;
+        cmd.count = count;
+        cmd.instanceCount = 1;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
+
     ctx->mtl_funcs.mtlDrawArrays(ctx, mode, first, count);
 }
 
@@ -226,7 +450,11 @@ void mglDrawElements(GLMContext ctx, GLenum mode, GLsizei count, GLenum type, co
 
     if (count == 0) { return; }
 
-    if (!check_element_type(type)) { ERROR_RETURN(GL_INVALID_VALUE); return; }
+    if (!check_element_type(type)) { ERROR_RETURN(GL_INVALID_ENUM); return; }
+
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
@@ -235,6 +463,20 @@ void mglDrawElements(GLMContext ctx, GLenum mode, GLsizei count, GLenum type, co
     }
 
     if (!validate_program(ctx)) { ERROR_RETURN(GL_INVALID_OPERATION); return; }
+
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ELEMENTS;
+        cmd.mode = mode;
+        cmd.count = count;
+        cmd.indexType = type;
+        cmd.indexBufferOffset = (GLuint)(uintptr_t)indices;
+        cmd.elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        cmd.instanceCount = 1;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
 
     ctx->mtl_funcs.mtlDrawElements(ctx, mode, count, type, indices);
 }
@@ -248,7 +490,11 @@ void mglDrawRangeElements(GLMContext ctx, GLenum mode, GLuint start, GLuint end,
 
     if (count == 0) { return; }
 
-    if (!check_element_type(type)) { ERROR_RETURN(GL_INVALID_VALUE); return; }
+    if (!check_element_type(type)) { ERROR_RETURN(GL_INVALID_ENUM); return; }
+
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
@@ -257,6 +503,20 @@ void mglDrawRangeElements(GLMContext ctx, GLenum mode, GLuint start, GLuint end,
     }
 
     if (!validate_program(ctx)) { ERROR_RETURN(GL_INVALID_OPERATION); return; }
+
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ELEMENTS;
+        cmd.mode = mode;
+        cmd.count = count;
+        cmd.indexType = type;
+        cmd.indexBufferOffset = (GLuint)(uintptr_t)indices;
+        cmd.elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        cmd.instanceCount = 1;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
 
     ctx->mtl_funcs.mtlDrawRangeElements(ctx, mode, start, end, count, type, indices);
 }
@@ -291,6 +551,18 @@ void mglDrawArraysInstanced(GLMContext ctx, GLenum mode, GLint first, GLsizei co
 
     if (!validate_program(ctx)) { ERROR_RETURN(GL_INVALID_OPERATION); return; }
 
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ARRAYS_INSTANCED;
+        cmd.mode = mode;
+        cmd.first = first;
+        cmd.count = count;
+        cmd.instanceCount = instancecount;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
+
     ctx->mtl_funcs.mtlDrawArraysInstanced(ctx, mode, first, count, instancecount);
 }
 
@@ -302,11 +574,15 @@ void mglDrawElementsInstanced(GLMContext ctx, GLenum mode, GLsizei count, GLenum
 
     if (count == 0) { return; }
 
-    if (!check_element_type(type)) { ERROR_RETURN(GL_INVALID_VALUE); return; }
+    if (!check_element_type(type)) { ERROR_RETURN(GL_INVALID_ENUM); return; }
 
     ERROR_CHECK_RETURN(instancecount >= 0, GL_INVALID_VALUE);
 
     if (instancecount == 0) { return; }
+
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
@@ -315,6 +591,20 @@ void mglDrawElementsInstanced(GLMContext ctx, GLenum mode, GLsizei count, GLenum
     }
 
     if (!validate_program(ctx)) { ERROR_RETURN(GL_INVALID_OPERATION); return; }
+
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ELEMENTS_INSTANCED;
+        cmd.mode = mode;
+        cmd.count = count;
+        cmd.indexType = type;
+        cmd.indexBufferOffset = (GLuint)(uintptr_t)indices;
+        cmd.elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        cmd.instanceCount = instancecount;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
 
     ctx->mtl_funcs.mtlDrawElementsInstanced(ctx, mode, count, type, indices, instancecount);
 }
@@ -326,14 +616,34 @@ void mglDrawElementsBaseVertex(GLMContext ctx, GLenum mode, GLsizei count, GLenu
     ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
     if (count == 0) return;
 
-    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_ENUM);
+
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ELEMENTS_BASE_VERTEX;
+        cmd.mode = mode;
+        cmd.count = count;
+        cmd.indexType = type;
+        cmd.indexBufferOffset = (GLuint)(uintptr_t)indices;
+        cmd.elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        cmd.baseVertex = basevertex;
+        cmd.instanceCount = 1;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
 
     ctx->mtl_funcs.mtlDrawElementsBaseVertex(ctx, mode, count, type, indices, basevertex);
 }
@@ -342,18 +652,39 @@ void mglDrawRangeElementsBaseVertex(GLMContext ctx, GLenum mode, GLuint start, G
 {
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(count > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
+    if (count == 0) return;
 
-    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(end > start, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(end >= start, GL_INVALID_VALUE);
+
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ELEMENTS_BASE_VERTEX;
+        cmd.mode = mode;
+        cmd.count = count;
+        cmd.indexType = type;
+        cmd.indexBufferOffset = (GLuint)(uintptr_t)indices;
+        cmd.elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        cmd.baseVertex = basevertex;
+        cmd.instanceCount = 1;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
 
     ctx->mtl_funcs.mtlDrawRangeElementsBaseVertex(ctx, mode, start, end, count, type, indices, basevertex);
 }
@@ -362,16 +693,38 @@ void mglDrawElementsInstancedBaseVertex(GLMContext ctx, GLenum mode, GLsizei cou
 {
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(count > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(instancecount >= 0, GL_INVALID_VALUE);
+    if (count == 0 || instancecount == 0) return;
 
-    ERROR_CHECK_RETURN(instancecount > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_ENUM);
+
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ELEMENTS_INSTANCED_BASE_VERTEX;
+        cmd.mode = mode;
+        cmd.count = count;
+        cmd.indexType = type;
+        cmd.indexBufferOffset = (GLuint)(uintptr_t)indices;
+        cmd.elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        cmd.instanceCount = instancecount;
+        cmd.baseVertex = basevertex;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
 
     ctx->mtl_funcs.mtlDrawElementsInstancedBaseVertex(ctx, mode, count, type, indices, instancecount, basevertex);
 }
@@ -389,6 +742,7 @@ void mglDrawArraysIndirect(GLMContext ctx, GLenum mode, const void *indirect)
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
+    mglFlushCommandBuffer(ctx);
     ctx->mtl_funcs.mtlDrawArraysIndirect(ctx, mode, indirect);
 }
 
@@ -396,29 +750,33 @@ void mglDrawElementsIndirect(GLMContext ctx, GLenum mode, GLenum type, const voi
 {
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_ENUM);
+
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
     ERROR_CHECK_RETURN(STATE(buffers[_DRAW_INDIRECT_BUFFER]), GL_INVALID_OPERATION);
 
-    ctx->mtl_funcs.mtlDrawArraysIndirect(ctx, mode, indirect);
+    mglFlushCommandBuffer(ctx);
+    ctx->mtl_funcs.mtlDrawElementsIndirect(ctx, mode, type, indirect);
 }
 
 void mglDrawArraysInstancedBaseInstance(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GLsizei instancecount, GLuint baseinstance)
 {
     ERROR_CHECK_RETURN(first >= 0, GL_INVALID_VALUE);
 
-    ERROR_CHECK_RETURN(count > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(instancecount > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(baseinstance >= 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(instancecount >= 0, GL_INVALID_VALUE);
+    if (count == 0 || instancecount == 0) return;
 
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
 
@@ -429,49 +787,99 @@ void mglDrawArraysInstancedBaseInstance(GLMContext ctx, GLenum mode, GLint first
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ARRAYS_INSTANCED_BASE_INSTANCE;
+        cmd.mode = mode;
+        cmd.first = first;
+        cmd.count = count;
+        cmd.instanceCount = instancecount;
+        cmd.baseInstance = baseinstance;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
+
     ctx->mtl_funcs.mtlDrawArraysInstancedBaseInstance(ctx, mode, first, count, instancecount, baseinstance);
 }
 
 void mglDrawElementsInstancedBaseInstance(GLMContext ctx, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount, GLuint baseinstance)
 {
-    ERROR_CHECK_RETURN(count > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(instancecount > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(baseinstance >= 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(instancecount >= 0, GL_INVALID_VALUE);
+    if (count == 0 || instancecount == 0) return;
 
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_ENUM);
+
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ELEMENTS_INSTANCED_BASE_INSTANCE;
+        cmd.mode = mode;
+        cmd.count = count;
+        cmd.indexType = type;
+        cmd.indexBufferOffset = (GLuint)(uintptr_t)indices;
+        cmd.elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        cmd.instanceCount = instancecount;
+        cmd.baseInstance = baseinstance;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
 
     ctx->mtl_funcs.mtlDrawElementsInstancedBaseInstance(ctx, mode, count, type, indices, instancecount, baseinstance);
 }
 
 void mglDrawElementsInstancedBaseVertexBaseInstance(GLMContext ctx, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount, GLint basevertex, GLuint baseinstance)
 {
-    ERROR_CHECK_RETURN(count > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(instancecount > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(baseinstance >= 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(instancecount >= 0, GL_INVALID_VALUE);
+    if (count == 0 || instancecount == 0) return;
 
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_ENUM);
+
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (ctx->draw_defer_enabled) {
+        MGLDrawCommand cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.type = MGL_CMD_DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE;
+        cmd.mode = mode;
+        cmd.count = count;
+        cmd.indexType = type;
+        cmd.indexBufferOffset = (GLuint)(uintptr_t)indices;
+        cmd.elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        cmd.instanceCount = instancecount;
+        cmd.baseVertex = basevertex;
+        cmd.baseInstance = baseinstance;
+        mglAppendDrawCommand(ctx, &cmd);
+        return;
+    }
 
     ctx->mtl_funcs.mtlDrawElementsInstancedBaseVertexBaseInstance(ctx, mode, count, type, indices, instancecount, basevertex, baseinstance);
 }
@@ -479,6 +887,14 @@ void mglDrawElementsInstancedBaseVertexBaseInstance(GLMContext ctx, GLenum mode,
 void mglMultiDrawArrays(GLMContext ctx, GLenum mode, const GLint *first, const GLsizei *count, GLsizei drawcount)
 {
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
+    ERROR_CHECK_RETURN(drawcount >= 0, GL_INVALID_VALUE);
+    if (drawcount == 0) return;
+    ERROR_CHECK_RETURN(first != NULL && count != NULL, GL_INVALID_VALUE);
+    for (GLsizei i = 0; i < drawcount; i++)
+    {
+        ERROR_CHECK_RETURN(first[i] >= 0, GL_INVALID_VALUE);
+        ERROR_CHECK_RETURN(count[i] >= 0, GL_INVALID_VALUE);
+    }
 
     if(validate_vao(ctx, false) == false)
     {
@@ -486,6 +902,24 @@ void mglMultiDrawArrays(GLMContext ctx, GLenum mode, const GLint *first, const G
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (ctx->draw_defer_enabled) {
+        for (GLsizei i = 0; i < drawcount; i++) {
+            if (count[i] == 0) {
+                continue;
+            }
+
+            MGLDrawCommand cmd;
+            memset(&cmd, 0, sizeof(cmd));
+            cmd.type = MGL_CMD_DRAW_ARRAYS;
+            cmd.mode = mode;
+            cmd.first = first[i];
+            cmd.count = count[i];
+            cmd.instanceCount = 1;
+            mglAppendDrawCommand(ctx, &cmd);
+        }
+        return;
+    }
 
     ctx->mtl_funcs.mtlMultiDrawArrays(ctx, mode, first, count, drawcount);
 }
@@ -494,18 +928,48 @@ void mglMultiDrawElements(GLMContext ctx, GLenum mode, const GLsizei *count, GLe
 {
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(count > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(drawcount >= 0, GL_INVALID_VALUE);
+    if (drawcount == 0) return;
+    ERROR_CHECK_RETURN(count != NULL && indices != NULL, GL_INVALID_VALUE);
+    for (GLsizei i = 0; i < drawcount; i++)
+    {
+        ERROR_CHECK_RETURN(count[i] >= 0, GL_INVALID_VALUE);
+    }
 
-    ERROR_CHECK_RETURN(drawcount > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_VALUE);
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (ctx->draw_defer_enabled) {
+        Buffer *elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        for (GLsizei i = 0; i < drawcount; i++) {
+            if (count[i] == 0) {
+                continue;
+            }
+
+            MGLDrawCommand cmd;
+            memset(&cmd, 0, sizeof(cmd));
+            cmd.type = MGL_CMD_DRAW_ELEMENTS;
+            cmd.mode = mode;
+            cmd.count = count[i];
+            cmd.indexType = type;
+            cmd.indexBufferOffset = (GLuint)(uintptr_t)indices[i];
+            cmd.elementBuffer = elementBuffer;
+            cmd.instanceCount = 1;
+            mglAppendDrawCommand(ctx, &cmd);
+        }
+        return;
+    }
 
     ctx->mtl_funcs.mtlMultiDrawElements(ctx, mode, count, type, indices, drawcount);
 }
@@ -514,18 +978,49 @@ void mglMultiDrawElementsBaseVertex(GLMContext ctx, GLenum mode, const GLsizei *
 {
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(count > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(drawcount >= 0, GL_INVALID_VALUE);
+    if (drawcount == 0) return;
+    ERROR_CHECK_RETURN(count != NULL && indices != NULL && basevertex != NULL, GL_INVALID_VALUE);
+    for (GLsizei i = 0; i < drawcount; i++)
+    {
+        ERROR_CHECK_RETURN(count[i] >= 0, GL_INVALID_VALUE);
+    }
 
-    ERROR_CHECK_RETURN(drawcount > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_VALUE);
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (ctx->draw_defer_enabled) {
+        Buffer *elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        for (GLsizei i = 0; i < drawcount; i++) {
+            if (count[i] == 0) {
+                continue;
+            }
+
+            MGLDrawCommand cmd;
+            memset(&cmd, 0, sizeof(cmd));
+            cmd.type = MGL_CMD_DRAW_ELEMENTS_BASE_VERTEX;
+            cmd.mode = mode;
+            cmd.count = count[i];
+            cmd.indexType = type;
+            cmd.indexBufferOffset = (GLuint)(uintptr_t)indices[i];
+            cmd.elementBuffer = elementBuffer;
+            cmd.baseVertex = basevertex[i];
+            cmd.instanceCount = 1;
+            mglAppendDrawCommand(ctx, &cmd);
+        }
+        return;
+    }
 
     ctx->mtl_funcs.mtlMultiDrawElementsBaseVertex(ctx, mode, count, type, indices, drawcount, basevertex);
 }
@@ -534,7 +1029,8 @@ void mglMultiDrawArraysIndirect(GLMContext ctx, GLenum mode, const void *indirec
 {
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(drawcount > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(drawcount >= 0, GL_INVALID_VALUE);
+    if (drawcount == 0) return;
 
     ERROR_CHECK_RETURN(stride % 4 == 0, GL_INVALID_VALUE);
 
@@ -547,6 +1043,7 @@ void mglMultiDrawArraysIndirect(GLMContext ctx, GLenum mode, const void *indirec
 
     ERROR_CHECK_RETURN(STATE(buffers[_DRAW_INDIRECT_BUFFER]), GL_INVALID_OPERATION);
 
+    mglFlushCommandBuffer(ctx);
     ctx->mtl_funcs.mtlMultiDrawArraysIndirect(ctx, mode, indirect, drawcount, stride);
 }
 
@@ -554,21 +1051,27 @@ void mglMultiDrawElementsIndirect(GLMContext ctx, GLenum mode, GLenum type, cons
 {
     ERROR_CHECK_RETURN(check_draw_modes(mode), GL_INVALID_ENUM);
 
-    ERROR_CHECK_RETURN(drawcount > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(drawcount >= 0, GL_INVALID_VALUE);
+    if (drawcount == 0) return;
 
     ERROR_CHECK_RETURN(stride % 4 == 0, GL_INVALID_VALUE);
 
-    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(check_element_type(type), GL_INVALID_ENUM);
+
+    if (should_skip_indexed_draw_no_element_buffer(ctx, __func__)) {
+        return;
+    }
 
     if(validate_vao(ctx, true) == false)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
     ERROR_CHECK_RETURN(STATE(buffers[_DRAW_INDIRECT_BUFFER]), GL_INVALID_OPERATION);
 
+    mglFlushCommandBuffer(ctx);
     ctx->mtl_funcs.mtlMultiDrawElementsIndirect(ctx, mode, type, indirect, drawcount, stride);
 }
-

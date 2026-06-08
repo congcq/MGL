@@ -11,11 +11,16 @@
 #include "glcorearb.h"
 
 #include "glm_context.h"
+#include <stdio.h>
 
-extern GLMContext _ctx;
 extern void mgl_lazy_init(void);
+extern GLuint textureIndexFromTarget(GLMContext ctx, GLenum target);
 
-#define GET_CONTEXT()   (mgl_lazy_init(), _ctx)
+#define GET_CONTEXT()   (mgl_lazy_init(), MGLgetCurrentContext())
+
+#ifndef MGL_VERBOSE_TEXBUFFER_LOGS
+#define MGL_VERBOSE_TEXBUFFER_LOGS 0
+#endif
 
 void glCullFace(GLenum mode)
 {
@@ -104,6 +109,12 @@ void glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels)
 {
     GLMContext ctx = GET_CONTEXT();
+
+    if (target == GL_PROXY_TEXTURE_2D) {
+        fprintf(stderr,
+                "MGL ABI TRACE glTexImage2D target=%x level=%d internal=%x width=%d height=%d border=%d format=%x type=%x pixels=%p\n",
+                target, level, internalformat, width, height, border, format, type, pixels);
+    }
 
     ctx->dispatch.tex_image2D(ctx, target, level, internalformat, width, height, border, format, type, pixels);
 }
@@ -288,6 +299,10 @@ void glGetIntegerv(GLenum pname, GLint *data)
     GLMContext ctx = GET_CONTEXT();
 
     ctx->dispatch.get_integerv(ctx, pname, data);
+
+    if (data && (pname == GL_MAX_TEXTURE_SIZE || pname == GL_MAX_VIEWPORT_DIMS)) {
+        fprintf(stderr, "MGL ABI TRACE glGetIntegerv pname=0x%x -> %d\n", pname, data[0]);
+    }
 }
 
 GLubyte const  *glGetString(GLenum name)
@@ -4479,6 +4494,15 @@ void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer)
 {
     GLMContext ctx = GET_CONTEXT();
 
+    if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+        fprintf(stderr,
+                "MGL TRACE glTexBuffer.entry target=0x%x internal=0x%x buffer=%u ctx=%p\n",
+                target,
+                internalformat,
+                buffer,
+                (void *)ctx);
+    }
+
     ctx->dispatch.tex_buffer(ctx, target, internalformat, buffer);
 }
 
@@ -6271,6 +6295,17 @@ void glTexBufferRange(GLenum target, GLenum internalformat, GLuint buffer, GLint
 {
     GLMContext ctx = GET_CONTEXT();
 
+    if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+        fprintf(stderr,
+                "MGL TRACE glTexBufferRange.entry target=0x%x internal=0x%x buffer=%u offset=%lld size=%lld ctx=%p\n",
+                target,
+                internalformat,
+                buffer,
+                (long long)offset,
+                (long long)size,
+                (void *)ctx);
+    }
+
     ctx->dispatch.tex_buffer_range(ctx, target, internalformat, buffer, offset, size);
 }
 
@@ -6789,6 +6824,13 @@ void glTextureBuffer(GLuint texture, GLenum internalformat, GLuint buffer)
 {
     GLMContext ctx = GET_CONTEXT();
 
+    fprintf(stderr,
+            "MGL TRACE glTextureBuffer.entry texture=%u internal=0x%x buffer=%u ctx=%p\n",
+            texture,
+            internalformat,
+            buffer,
+            (void *)ctx);
+
     ctx->dispatch.texture_buffer(ctx, texture, internalformat, buffer);
 }
 
@@ -6796,7 +6838,136 @@ void glTextureBufferRange(GLuint texture, GLenum internalformat, GLuint buffer, 
 {
     GLMContext ctx = GET_CONTEXT();
 
+    if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+        fprintf(stderr,
+                "MGL TRACE glTextureBufferRange.entry texture=%u internal=0x%x buffer=%u offset=%lld size=%lld ctx=%p\n",
+                texture,
+                internalformat,
+                buffer,
+                (long long)offset,
+                (long long)size,
+                (void *)ctx);
+    }
+
     ctx->dispatch.texture_buffer_range(ctx, texture, internalformat, buffer, offset, size);
+}
+
+void glTexBufferARB(GLenum target, GLenum internalformat, GLuint buffer)
+{
+    GLMContext ctx = GET_CONTEXT();
+
+    if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+        fprintf(stderr,
+                "MGL TRACE glTexBufferARB.entry target=0x%x internal=0x%x buffer=%u ctx=%p\n",
+                target,
+                internalformat,
+                buffer,
+                (void *)ctx);
+    }
+
+    ctx->dispatch.tex_buffer(ctx, target, internalformat, buffer);
+}
+
+void glTextureBufferEXT(GLuint texture, GLenum target, GLenum internalformat, GLuint buffer)
+{
+    GLMContext ctx = GET_CONTEXT();
+
+    if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+        fprintf(stderr,
+                "MGL TRACE glTextureBufferEXT.entry texture=%u target=0x%x internal=0x%x buffer=%u ctx=%p\n",
+                texture,
+                target,
+                internalformat,
+                buffer,
+                (void *)ctx);
+    }
+
+    if (target != GL_TEXTURE_BUFFER) {
+        if (ctx) {
+            ctx->state.error = GL_INVALID_ENUM;
+        }
+        return;
+    }
+
+    ctx->dispatch.texture_buffer(ctx, texture, internalformat, buffer);
+}
+
+void glTextureBufferRangeEXT(GLuint texture, GLenum target, GLenum internalformat, GLuint buffer, GLintptr offset, GLsizeiptr size)
+{
+    GLMContext ctx = GET_CONTEXT();
+
+    if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+        fprintf(stderr,
+                "MGL TRACE glTextureBufferRangeEXT.entry texture=%u target=0x%x internal=0x%x buffer=%u offset=%lld size=%lld ctx=%p\n",
+                texture,
+                target,
+                internalformat,
+                buffer,
+                (long long)offset,
+                (long long)size,
+                (void *)ctx);
+    }
+
+    if (target != GL_TEXTURE_BUFFER) {
+        if (ctx) {
+            ctx->state.error = GL_INVALID_ENUM;
+        }
+        return;
+    }
+
+    ctx->dispatch.texture_buffer_range(ctx, texture, internalformat, buffer, offset, size);
+}
+
+void glMultiTexBufferEXT(GLenum texunit, GLenum target, GLenum internalformat, GLuint buffer)
+{
+    GLMContext ctx = GET_CONTEXT();
+    GLuint unit = texunit;
+    GLuint index = _MAX_TEXTURE_TYPES;
+    Texture *tex = NULL;
+
+    if (texunit >= GL_TEXTURE0) {
+        unit = texunit - GL_TEXTURE0;
+    }
+
+    if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+        fprintf(stderr,
+                "MGL TRACE glMultiTexBufferEXT.entry texunit=0x%x unit=%u target=0x%x internal=0x%x buffer=%u ctx=%p\n",
+                texunit,
+                unit,
+                target,
+                internalformat,
+                buffer,
+                (void *)ctx);
+    }
+
+    if (!ctx || target != GL_TEXTURE_BUFFER || unit >= TEXTURE_UNITS) {
+        if (ctx) {
+            ctx->state.error = (target == GL_TEXTURE_BUFFER) ? GL_INVALID_VALUE : GL_INVALID_ENUM;
+        }
+        return;
+    }
+
+    index = textureIndexFromTarget(ctx, target);
+    if (index >= _MAX_TEXTURE_TYPES) {
+        ctx->state.error = GL_INVALID_ENUM;
+        return;
+    }
+
+    tex = ctx->state.texture_units[unit].textures[index];
+    if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+        fprintf(stderr,
+                "MGL TRACE glMultiTexBufferEXT.resolve unit=%u boundTex=%u tex=%p\n",
+                unit,
+                tex ? tex->name : 0u,
+                (void *)tex);
+    }
+
+    if (!tex) {
+        ctx->state.error = GL_INVALID_OPERATION;
+        return;
+    }
+
+    ctx->dispatch.texture_buffer(ctx, tex->name, internalformat, buffer);
 }
 
 void glTextureStorage1D(GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width)
@@ -7351,4 +7522,3 @@ void glPolygonOffsetClamp(GLfloat factor, GLfloat units, GLfloat clamp)
 
     ctx->dispatch.polygon_offset_clamp(ctx, factor, units, clamp);
 }
-

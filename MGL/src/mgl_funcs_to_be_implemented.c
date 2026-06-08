@@ -7,23 +7,583 @@
 //
 
 #include <assert.h>
+#include <stdio.h>
+#include <string.h>
 
+#include "spirv_cross_c.h"
 #include "mgl.h"
+#include "draw_command.h"
 
-#define assert(i) printf("Unimplemented function %s\n", __func__)
+#ifndef MGL_VERBOSE_TEXBUFFER_LOGS
+#define MGL_VERBOSE_TEXBUFFER_LOGS 0
+#endif
+
+static void mgl_unimplemented(GLMContext ctx, const char *func)
+{
+    static uint32_t warn_count = 0u;
+    if (warn_count < 128u) {
+        fprintf(stderr, "MGL WARNING: %s is unimplemented, returning GL_INVALID_OPERATION\n",
+                func ? func : "(unknown)");
+        warn_count++;
+    }
+    if (ctx) {
+        STATE(error) = GL_INVALID_OPERATION;
+    }
+}
 
 // Forward declarations for transform feedback functions from program.c
 TransformFeedback *newTransformFeedback(GLMContext ctx, GLuint name);
 TransformFeedback *findTransformFeedback(GLMContext ctx, GLuint name);
 TransformFeedback *getTransformFeedback(GLMContext ctx, GLuint name);
+Program *findProgram(GLMContext ctx, GLuint program);
+ProgramPipeline *findProgramPipeline(GLMContext ctx, GLuint pipeline);
 
 // Forward declaration for texture lookup from textures.c
 extern Texture *findTexture(GLMContext ctx, GLuint texture);
 extern Texture *currentTexture(GLMContext ctx, GLuint index);
+extern Texture *getTex(GLMContext ctx, GLuint name, GLenum target);
+extern void mglTextureBufferRange(GLMContext ctx, GLuint texture, GLenum internalformat, GLuint buffer, GLintptr offset, GLsizeiptr size);
+extern void mglTraceLogExternal(const char *fmt, ...);
+
+typedef struct QueryObject_t {
+	GLuint name;
+	GLenum target;
+	GLboolean active;
+	GLboolean available;
+	GLuint64 result;
+} QueryObject;
+
+static HashTable s_query_table;
+static GLboolean s_query_table_initialized = GL_FALSE;
+static GLuint s_active_query_by_target[8];
+static GLuint64 s_fake_timestamp_counter = 1;
+
+static size_t mgl_round_up_16(size_t value)
+{
+	return value ? ((value + 15) & ~(size_t)15) : 0;
+}
+
+static GLuint mgl_effective_max_viewports(GLMContext ctx)
+{
+	GLuint max_viewports = ctx ? ctx->state.var.max_viewports : 1;
+	if (max_viewports == 0 || max_viewports > MGL_MAX_VIEWPORTS) {
+		max_viewports = MGL_MAX_VIEWPORTS;
+	}
+	return max_viewports ? max_viewports : 1;
+}
+
+static GLboolean mgl_validate_viewport_range(GLMContext ctx, GLuint first, GLsizei count)
+{
+	ERROR_CHECK_RETURN_VALUE(count >= 0, GL_INVALID_VALUE, GL_FALSE);
+	GLuint max_viewports = mgl_effective_max_viewports(ctx);
+	ERROR_CHECK_RETURN_VALUE(first <= max_viewports, GL_INVALID_VALUE, GL_FALSE);
+	ERROR_CHECK_RETURN_VALUE((GLuint)count <= max_viewports - first, GL_INVALID_VALUE, GL_FALSE);
+	return GL_TRUE;
+}
+
+static void mgl_init_query_table_if_needed(void)
+{
+	if (!s_query_table_initialized)
+	{
+		initHashTable(&s_query_table, 64);
+		memset(s_active_query_by_target, 0, sizeof(s_active_query_by_target));
+		s_query_table_initialized = GL_TRUE;
+	}
+}
+
+static int mgl_query_target_slot(GLenum target)
+{
+	switch (target)
+	{
+		case GL_SAMPLES_PASSED: return 0;
+		case GL_ANY_SAMPLES_PASSED: return 1;
+		case GL_ANY_SAMPLES_PASSED_CONSERVATIVE: return 2;
+		case GL_PRIMITIVES_GENERATED: return 3;
+		case GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN: return 4;
+		case GL_TIME_ELAPSED: return 5;
+		default: return -1;
+	}
+}
+
+static QueryObject *mgl_find_query(GLuint id)
+{
+	mgl_init_query_table_if_needed();
+	return (QueryObject *)searchHashTable(&s_query_table, id);
+}
+
+static QueryObject *mgl_get_query(GLuint id)
+{
+	QueryObject *q;
+
+	mgl_init_query_table_if_needed();
+	q = (QueryObject *)searchHashTable(&s_query_table, id);
+	if (!q)
+	{
+		q = (QueryObject *)calloc(1, sizeof(QueryObject));
+		if (!q)
+			return NULL;
+		q->name = id;
+		insertHashElement(&s_query_table, id, q);
+	}
+	return q;
+}
+
+static int mgl_program_interface_to_spvc(GLenum programInterface)
+{
+	switch (programInterface)
+	{
+		case GL_PROGRAM_INPUT: return _STAGE_INPUT_RES;
+		case GL_PROGRAM_OUTPUT: return _STAGE_OUTPUT_RES;
+		case GL_UNIFORM: return _UNIFORM_CONSTANT_RES;
+		case GL_UNIFORM_BLOCK: return _UNIFORM_BUFFER_RES;
+		case GL_SHADER_STORAGE_BLOCK: return _STORAGE_BUFFER_RES;
+		case GL_BUFFER_VARIABLE: return _STORAGE_BUFFER_RES;
+		case GL_ATOMIC_COUNTER_BUFFER: return _ATOMIC_COUNTER_RES;
+		default: return -1;
+	}
+}
+
+static int mgl_program_interface_to_spvc_list(GLenum programInterface, int *types, int max_types)
+{
+	if (!types || max_types <= 0)
+		return 0;
+
+	if (programInterface == GL_UNIFORM)
+	{
+		int n = 0;
+		types[n++] = SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT;
+		if (n < max_types) types[n++] = SPVC_RESOURCE_TYPE_SAMPLED_IMAGE;
+		if (n < max_types) types[n++] = SPVC_RESOURCE_TYPE_SEPARATE_IMAGE;
+		if (n < max_types) types[n++] = SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS;
+		if (n < max_types) types[n++] = SPVC_RESOURCE_TYPE_STORAGE_IMAGE;
+		return n;
+	}
+
+	int type = mgl_program_interface_to_spvc(programInterface);
+	if (type < 0)
+		return 0;
+
+	types[0] = type;
+	return 1;
+}
+
+static GLboolean mgl_program_uniform_block_identity_matches(const SpirvResource *a, const SpirvResource *b)
+{
+	if (!a || !b)
+		return GL_FALSE;
+
+	if (a->name && b->name && a->name[0] != '\0' && b->name[0] != '\0')
+		return strcmp(a->name, b->name) == 0 ? GL_TRUE : GL_FALSE;
+
+	if ((a->name && a->name[0] != '\0') || (b->name && b->name[0] != '\0'))
+		return GL_FALSE;
+
+	return a->gl_binding == b->gl_binding ? GL_TRUE : GL_FALSE;
+}
+
+static GLboolean mgl_program_uniform_block_seen_before(Program *pptr, int target_stage, GLuint target_index)
+{
+	if (!pptr || target_stage < 0 || target_stage >= _MAX_SHADER_TYPES)
+		return GL_FALSE;
+
+	SpirvResourceList *target_resources =
+		&pptr->spirv_resources_list[target_stage][SPVC_RESOURCE_TYPE_UNIFORM_BUFFER];
+	if (!target_resources->list || target_index >= target_resources->count)
+		return GL_FALSE;
+
+	SpirvResource *target = &target_resources->list[target_index];
+	for (int stage = 0; stage <= target_stage && stage < _MAX_SHADER_TYPES; stage++)
+	{
+		SpirvResourceList *resources =
+			&pptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_BUFFER];
+		GLuint limit = (stage == target_stage) ? target_index : resources->count;
+		for (GLuint i = 0; resources->list && i < limit; i++)
+		{
+			if (mgl_program_uniform_block_identity_matches(&resources->list[i], target))
+				return GL_TRUE;
+		}
+	}
+
+	return GL_FALSE;
+}
+
+static GLboolean mgl_program_uniform_block_referenced_by_stage(Program *pptr, const SpirvResource *block, int query_stage)
+{
+	if (!pptr || !block || query_stage < 0 || query_stage >= _MAX_SHADER_TYPES)
+		return GL_FALSE;
+
+	SpirvResourceList *resources =
+		&pptr->spirv_resources_list[query_stage][SPVC_RESOURCE_TYPE_UNIFORM_BUFFER];
+	for (GLuint i = 0; resources->list && i < resources->count; i++)
+	{
+		if (mgl_program_uniform_block_identity_matches(block, &resources->list[i]))
+			return GL_TRUE;
+	}
+
+	return GL_FALSE;
+}
+
+static size_t mgl_program_uniform_block_required_size(Program *pptr, const SpirvResource *block)
+{
+	size_t required_size = 0;
+
+	if (!pptr || !block)
+		return 0;
+
+	for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++)
+	{
+		SpirvResourceList *resources =
+			&pptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_BUFFER];
+		for (GLuint i = 0; resources->list && i < resources->count; i++)
+		{
+			if (mgl_program_uniform_block_identity_matches(block, &resources->list[i]) &&
+			    resources->list[i].required_size > required_size)
+				required_size = resources->list[i].required_size;
+		}
+	}
+
+	return mgl_round_up_16(required_size);
+}
+
+static GLsizei mgl_program_resource_count_for_type(Program *pptr, int res_type)
+{
+	GLsizei total = 0;
+	for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
+		if (res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT && stage != _VERTEX_SHADER)
+			continue;
+		if (res_type == SPVC_RESOURCE_TYPE_STAGE_OUTPUT && stage != _FRAGMENT_SHADER)
+			continue;
+		GLuint count = pptr->spirv_resources_list[stage][res_type].count;
+		if (res_type != SPVC_RESOURCE_TYPE_UNIFORM_BUFFER) {
+			total += (GLsizei)count;
+			continue;
+		}
+		for (GLuint i = 0; i < count; i++) {
+			if (!mgl_program_uniform_block_seen_before(pptr, stage, i))
+				total++;
+		}
+	}
+	return total;
+}
+
+static GLsizei mgl_program_resource_count(Program *pptr, const int *types, int type_count)
+{
+	GLsizei total = 0;
+	for (int i = 0; i < type_count; i++)
+		total += mgl_program_resource_count_for_type(pptr, types[i]);
+	return total;
+}
+
+static SpirvResource *mgl_program_resource_at_index_for_type(Program *pptr, int res_type, GLuint index, int *out_stage)
+{
+	GLuint ordinal = 0;
+	for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++)
+	{
+		if (res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT && stage != _VERTEX_SHADER)
+			continue;
+		if (res_type == SPVC_RESOURCE_TYPE_STAGE_OUTPUT && stage != _FRAGMENT_SHADER)
+			continue;
+		GLuint count = pptr->spirv_resources_list[stage][res_type].count;
+		for (GLuint i = 0; i < count; i++)
+		{
+			if (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER &&
+			    mgl_program_uniform_block_seen_before(pptr, stage, i))
+				continue;
+			if (ordinal == index)
+			{
+				if (out_stage)
+					*out_stage = stage;
+				return &pptr->spirv_resources_list[stage][res_type].list[i];
+			}
+			ordinal++;
+		}
+	}
+	return NULL;
+}
+
+static SpirvResource *mgl_program_resource_at_index(Program *pptr, const int *types, int type_count, GLuint index, int *out_stage, int *out_res_type)
+{
+	GLuint offset = 0;
+	for (int t = 0; t < type_count; t++)
+	{
+		GLsizei count = mgl_program_resource_count_for_type(pptr, types[t]);
+		if (index < offset + (GLuint)count)
+		{
+			SpirvResource *res = mgl_program_resource_at_index_for_type(pptr, types[t], index - offset, out_stage);
+			if (res && out_res_type)
+				*out_res_type = types[t];
+			return res;
+		}
+		offset += (GLuint)count;
+	}
+	return NULL;
+}
+
+static SpirvResource *mgl_program_resource_find_by_name_for_type(Program *pptr, int res_type, const GLchar *name, GLuint *out_index, int *out_stage)
+{
+	GLuint ordinal = 0;
+	for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++)
+	{
+		if (res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT && stage != _VERTEX_SHADER)
+			continue;
+		if (res_type == SPVC_RESOURCE_TYPE_STAGE_OUTPUT && stage != _FRAGMENT_SHADER)
+			continue;
+		GLuint count = pptr->spirv_resources_list[stage][res_type].count;
+		for (GLuint i = 0; i < count; i++)
+		{
+			SpirvResource *res = &pptr->spirv_resources_list[stage][res_type].list[i];
+			if (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER &&
+			    mgl_program_uniform_block_seen_before(pptr, stage, i))
+				continue;
+			if (res->name && !strcmp(res->name, name))
+			{
+				if (out_index)
+					*out_index = ordinal;
+				if (out_stage)
+					*out_stage = stage;
+				return res;
+			}
+			ordinal++;
+		}
+	}
+	return NULL;
+}
+
+static SpirvResource *mgl_program_resource_find_by_name(Program *pptr, const int *types, int type_count, const GLchar *name, GLuint *out_index, int *out_stage, int *out_res_type)
+{
+	GLuint offset = 0;
+	for (int t = 0; t < type_count; t++)
+	{
+		GLuint local_index = 0;
+		SpirvResource *res = mgl_program_resource_find_by_name_for_type(pptr, types[t], name, &local_index, out_stage);
+		if (res)
+		{
+			if (out_index)
+				*out_index = offset + local_index;
+			if (out_res_type)
+				*out_res_type = types[t];
+			return res;
+		}
+		offset += (GLuint)mgl_program_resource_count_for_type(pptr, types[t]);
+	}
+	return NULL;
+}
+
+static GLint mgl_program_resource_gl_type(const SpirvResource *res, int res_type)
+{
+	if (!res)
+		return 0;
+
+	if (res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT)
+	{
+		const char *name = res->name;
+		if (!name || !name[0])
+			return GL_FLOAT;
+		if (!strcmp(name, "Position") || !strcmp(name, "Normal"))
+			return GL_FLOAT_VEC3;
+		if (!strcmp(name, "Color"))
+			return GL_FLOAT_VEC4;
+		if (!strcmp(name, "UV") || !strcmp(name, "UV0") ||
+		    !strcmp(name, "TexCoord") || !strcmp(name, "texCoord"))
+			return GL_FLOAT_VEC2;
+		if (!strcmp(name, "UV1") || !strcmp(name, "UV2"))
+			return GL_INT_VEC2;
+		if (strstr(name, "Color"))
+			return GL_FLOAT_VEC4;
+		if (strstr(name, "UV") || strstr(name, "TexCoord") || strstr(name, "texCoord"))
+			return GL_FLOAT_VEC2;
+		if (strstr(name, "Normal"))
+			return GL_FLOAT_VEC3;
+		return GL_FLOAT_VEC4;
+	}
+
+	if (res_type == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE ||
+	    res_type == SPVC_RESOURCE_TYPE_SEPARATE_IMAGE)
+	{
+		switch (res->image_dim)
+		{
+			case 0: return res->image_arrayed ? GL_SAMPLER_1D_ARRAY : GL_SAMPLER_1D;
+			case 1: return res->image_arrayed ? GL_SAMPLER_2D_ARRAY : GL_SAMPLER_2D;
+			case 2: return GL_SAMPLER_3D;
+			case 3: return res->image_arrayed ? GL_SAMPLER_CUBE_MAP_ARRAY : GL_SAMPLER_CUBE;
+			case 5: return GL_INT_SAMPLER_BUFFER;
+			default: return GL_SAMPLER_2D;
+		}
+	}
+
+	if (res_type == SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS)
+		return GL_SAMPLER_2D;
+
+	if (res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE)
+		return (res->image_dim == 5) ? GL_INT_IMAGE_BUFFER : GL_INT_IMAGE_2D;
+
+	return 0;
+}
+
+static GLboolean mgl_program_resource_names_match(const char *resource_name, const char *query_name)
+{
+	size_t resource_len;
+	size_t query_len;
+
+	if (!resource_name || !query_name)
+		return GL_FALSE;
+
+	resource_len = strlen(resource_name);
+	query_len = strlen(query_name);
+	if (resource_len == 0 || query_len == 0)
+		return GL_FALSE;
+
+	if (resource_len == query_len && memcmp(resource_name, query_name, resource_len) == 0)
+		return GL_TRUE;
+
+	if (query_len == resource_len + 3 &&
+	    query_name[resource_len] == '[' &&
+	    query_name[resource_len + 1] == '0' &&
+	    query_name[resource_len + 2] == ']' &&
+	    memcmp(resource_name, query_name, resource_len) == 0)
+		return GL_TRUE;
+
+	if (resource_len == query_len + 3 &&
+	    resource_name[query_len] == '[' &&
+	    resource_name[query_len + 1] == '0' &&
+	    resource_name[query_len + 2] == ']' &&
+	    memcmp(resource_name, query_name, query_len) == 0)
+		return GL_TRUE;
+
+	return GL_FALSE;
+}
+
+static GLboolean mgl_program_uniform_referenced_by_stage(Program *pptr, const char *name, int target_stage)
+{
+	static const int uniform_resource_types[] = {
+		SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT,
+		SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+		SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
+		SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
+		SPVC_RESOURCE_TYPE_STORAGE_IMAGE
+	};
+
+	if (!pptr || !name || target_stage < 0 || target_stage >= _MAX_SHADER_TYPES)
+		return GL_FALSE;
+
+	for (size_t t = 0; t < sizeof(uniform_resource_types) / sizeof(uniform_resource_types[0]); t++)
+	{
+		int res_type = uniform_resource_types[t];
+		SpirvResourceList *resources = &pptr->spirv_resources_list[target_stage][res_type];
+		for (GLuint i = 0; resources->list && i < resources->count; i++)
+		{
+			if (mgl_program_resource_names_match(resources->list[i].name, name))
+				return GL_TRUE;
+		}
+	}
+
+	return GL_FALSE;
+}
+
+static GLint mgl_program_uniform_resource_location(GLMContext ctx, GLuint program, const SpirvResource *res)
+{
+	if (!ctx || !res || !res->name)
+		return -1;
+
+	GLint location = mglGetUniformLocation(ctx, program, res->name);
+	if (location >= 0)
+		return location;
+
+	if (res->uniform_location >= 0)
+		return res->uniform_location;
+
+	return -1;
+}
+
+static GLboolean mgl_get_program_uniform_resourceiv(GLMContext ctx,
+                                                    GLuint program,
+                                                    Program *pptr,
+                                                    GLuint index,
+                                                    GLsizei propCount,
+                                                    const GLenum *props,
+                                                    GLsizei count,
+                                                    GLsizei *length,
+                                                    GLint *params)
+{
+	int stage = -1;
+	int res_type = -1;
+	SpirvResource *res = mglProgramActiveUniformAt(pptr, index, &stage, &res_type);
+	if (!res)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return GL_FALSE;
+	}
+
+	GLsizei n = (propCount < count) ? propCount : count;
+	for (GLsizei i = 0; i < n; i++)
+	{
+		switch (props[i])
+		{
+			case GL_NAME_LENGTH:
+				params[i] = (GLint)mglProgramActiveUniformNameLength(res) + 1;
+				break;
+			case GL_TYPE:
+				params[i] = mglProgramActiveUniformGLType(res, res_type);
+				break;
+			case GL_ARRAY_SIZE:
+				params[i] = mglProgramActiveUniformSize(res, res_type);
+				break;
+			case GL_OFFSET:
+			case GL_BLOCK_INDEX:
+			case GL_ATOMIC_COUNTER_BUFFER_INDEX:
+				params[i] = -1;
+				break;
+			case GL_ARRAY_STRIDE:
+			case GL_MATRIX_STRIDE:
+			case GL_BUFFER_DATA_SIZE:
+			case GL_NUM_ACTIVE_VARIABLES:
+				params[i] = 0;
+				break;
+			case GL_IS_ROW_MAJOR:
+				params[i] = GL_FALSE;
+				break;
+			case GL_BUFFER_BINDING:
+				params[i] = -1;
+				break;
+			case GL_REFERENCED_BY_VERTEX_SHADER:
+				params[i] = mgl_program_uniform_referenced_by_stage(pptr, res->name, _VERTEX_SHADER);
+				break;
+			case GL_REFERENCED_BY_FRAGMENT_SHADER:
+				params[i] = mgl_program_uniform_referenced_by_stage(pptr, res->name, _FRAGMENT_SHADER);
+				break;
+			case GL_REFERENCED_BY_GEOMETRY_SHADER:
+				params[i] = mgl_program_uniform_referenced_by_stage(pptr, res->name, _GEOMETRY_SHADER);
+				break;
+			case GL_REFERENCED_BY_TESS_CONTROL_SHADER:
+				params[i] = mgl_program_uniform_referenced_by_stage(pptr, res->name, _TESS_CONTROL_SHADER);
+				break;
+			case GL_REFERENCED_BY_TESS_EVALUATION_SHADER:
+				params[i] = mgl_program_uniform_referenced_by_stage(pptr, res->name, _TESS_EVALUATION_SHADER);
+				break;
+			case GL_REFERENCED_BY_COMPUTE_SHADER:
+				params[i] = mgl_program_uniform_referenced_by_stage(pptr, res->name, _COMPUTE_SHADER);
+				break;
+			case GL_LOCATION:
+				params[i] = mgl_program_uniform_resource_location(ctx, program, res);
+				break;
+			case GL_LOCATION_INDEX:
+				params[i] = (mgl_program_uniform_resource_location(ctx, program, res) >= 0) ? 0 : -1;
+				break;
+			default:
+				STATE(error) = GL_INVALID_ENUM;
+				return GL_FALSE;
+		}
+	}
+
+	if (length)
+		*length = n;
+	return GL_TRUE;
+}
 
 void mglActiveShaderProgram(GLMContext ctx, GLuint pipeline, GLuint program)
 {
 	// Set active program in pipeline - no-op for now
+	(void)ctx;
 	(void)pipeline;
 	(void)program;
 }
@@ -31,23 +591,56 @@ void mglActiveShaderProgram(GLMContext ctx, GLuint pipeline, GLuint program)
 void mglBeginConditionalRender(GLMContext ctx, GLuint id, GLenum mode)
 {
 	// Conditional render - no-op, always render
+	(void)ctx;
 	(void)id;
 	(void)mode;
 }
 
 void mglBeginQuery(GLMContext ctx, GLenum target, GLuint id)
 {
-	// Query - no-op, basic stub
-	(void)target;
-	(void)id;
+	int slot;
+	QueryObject *q;
+
+	slot = mgl_query_target_slot(target);
+	if (slot < 0)
+	{
+		STATE(error) = GL_INVALID_ENUM;
+		return;
+	}
+	if (id == 0)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return;
+	}
+
+	q = mgl_get_query(id);
+	if (!q)
+	{
+		STATE(error) = GL_OUT_OF_MEMORY;
+		return;
+	}
+
+	if (q->active || (q->target != 0 && q->target != target) || s_active_query_by_target[slot] != 0)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return;
+	}
+
+	q->target = target;
+	q->active = GL_TRUE;
+	q->available = GL_FALSE;
+	q->result = 0;
+	s_active_query_by_target[slot] = id;
 }
 
 void mglBeginQueryIndexed(GLMContext ctx, GLenum target, GLuint index, GLuint id)
 {
-	// Indexed query - no-op, basic stub
-	(void)target;
-	(void)index;
-	(void)id;
+	if (index != 0)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+	mglBeginQuery(ctx, target, id);
 }
 
 void mglBeginTransformFeedback(GLMContext ctx, GLenum primitiveMode)
@@ -122,43 +715,186 @@ void mglBindTransformFeedback(GLMContext ctx, GLenum target, GLuint id)
 void mglClampColor(GLMContext ctx, GLenum target, GLenum clamp)
 {
 	// Clamp color - no-op, clamping handled automatically
+	(void)ctx;
 	(void)target;
 	(void)clamp;
 }
 
 void mglClearBufferiv(GLMContext ctx, GLenum buffer, GLint drawbuffer, const GLint *value)
 {
-	// Clear buffer - use standard clear functions
-	(void)buffer;
-	(void)drawbuffer;
-	(void)value;
+	if (!value)
+	{
+		ERROR_RETURN(GL_INVALID_VALUE);
+		return;
+	}
+
+	GLuint maxDrawBuffers = STATE(var.max_draw_buffers);
+	if (maxDrawBuffers == 0 || maxDrawBuffers > MAX_COLOR_ATTACHMENTS)
+		maxDrawBuffers = MAX_COLOR_ATTACHMENTS;
+
+	switch (buffer)
+	{
+		case GL_COLOR:
+			if (drawbuffer < 0 || drawbuffer >= (GLint)maxDrawBuffers)
+			{
+				ERROR_RETURN(GL_INVALID_VALUE);
+				return;
+			}
+			mglFlushCommandBuffer(ctx);
+			if (STATE(framebuffer))
+			{
+				Framebuffer *fbo = STATE(framebuffer);
+				GLenum drawBuffer = ((GLsizei)drawbuffer < STATE(draw_buffer_count))
+					? STATE(draw_buffers[drawbuffer])
+					: GL_NONE;
+				if (drawBuffer >= GL_COLOR_ATTACHMENT0 &&
+					drawBuffer < (GL_COLOR_ATTACHMENT0 + STATE(max_color_attachments)) &&
+					drawBuffer < (GL_COLOR_ATTACHMENT0 + MAX_COLOR_ATTACHMENTS))
+				{
+					GLuint attachmentIndex = (GLuint)(drawBuffer - GL_COLOR_ATTACHMENT0);
+					if (fbo->color_attachment_bitfield & (1u << attachmentIndex))
+					{
+						FBOAttachment *att = &fbo->color_attachments[attachmentIndex];
+						att->clear_bitmask |= GL_COLOR_BUFFER_BIT;
+						att->clear_color[0] = (GLfloat)value[0];
+						att->clear_color[1] = (GLfloat)value[1];
+						att->clear_color[2] = (GLfloat)value[2];
+						att->clear_color[3] = (GLfloat)value[3];
+					}
+				}
+			}
+			else if (drawbuffer == 0)
+			{
+				STATE(default_fbo_clear_bitmask) |= GL_COLOR_BUFFER_BIT;
+				STATE(default_clear_color[0]) = (GLfloat)value[0];
+				STATE(default_clear_color[1]) = (GLfloat)value[1];
+				STATE(default_clear_color[2]) = (GLfloat)value[2];
+				STATE(default_clear_color[3]) = (GLfloat)value[3];
+			}
+			STATE(dirty_bits) |= DIRTY_FBO | DIRTY_STATE;
+			break;
+		case GL_STENCIL:
+			if (drawbuffer != 0)
+			{
+				ERROR_RETURN(GL_INVALID_VALUE);
+				return;
+			}
+			mglClearStencil(ctx, value[0]);
+			mglClear(ctx, GL_STENCIL_BUFFER_BIT);
+			break;
+		default:
+			ERROR_RETURN(GL_INVALID_ENUM);
+			break;
+	}
 }
 
 void mglClearBufferuiv(GLMContext ctx, GLenum buffer, GLint drawbuffer, const GLuint *value)
 {
-	// Clear buffer - use standard clear functions
-	(void)buffer;
-	(void)drawbuffer;
-	(void)value;
+	if (!value)
+	{
+		ERROR_RETURN(GL_INVALID_VALUE);
+		return;
+	}
+	GLuint maxDrawBuffers = STATE(var.max_draw_buffers);
+	if (maxDrawBuffers == 0 || maxDrawBuffers > MAX_COLOR_ATTACHMENTS)
+		maxDrawBuffers = MAX_COLOR_ATTACHMENTS;
+
+	if (buffer == GL_COLOR)
+	{
+		if (drawbuffer < 0 || drawbuffer >= (GLint)maxDrawBuffers)
+		{
+			ERROR_RETURN(GL_INVALID_VALUE);
+			return;
+		}
+		mglFlushCommandBuffer(ctx);
+		if (STATE(framebuffer))
+		{
+			Framebuffer *fbo = STATE(framebuffer);
+			GLenum drawBuffer = ((GLsizei)drawbuffer < STATE(draw_buffer_count))
+				? STATE(draw_buffers[drawbuffer])
+				: GL_NONE;
+			if (drawBuffer >= GL_COLOR_ATTACHMENT0 &&
+				drawBuffer < (GL_COLOR_ATTACHMENT0 + STATE(max_color_attachments)) &&
+				drawBuffer < (GL_COLOR_ATTACHMENT0 + MAX_COLOR_ATTACHMENTS))
+			{
+				GLuint attachmentIndex = (GLuint)(drawBuffer - GL_COLOR_ATTACHMENT0);
+				if (fbo->color_attachment_bitfield & (1u << attachmentIndex))
+				{
+					FBOAttachment *att = &fbo->color_attachments[attachmentIndex];
+					att->clear_bitmask |= GL_COLOR_BUFFER_BIT;
+					att->clear_color[0] = (GLfloat)value[0];
+					att->clear_color[1] = (GLfloat)value[1];
+					att->clear_color[2] = (GLfloat)value[2];
+					att->clear_color[3] = (GLfloat)value[3];
+				}
+			}
+		}
+		else if (drawbuffer == 0)
+		{
+			STATE(default_fbo_clear_bitmask) |= GL_COLOR_BUFFER_BIT;
+			STATE(default_clear_color[0]) = (GLfloat)value[0];
+			STATE(default_clear_color[1]) = (GLfloat)value[1];
+			STATE(default_clear_color[2]) = (GLfloat)value[2];
+			STATE(default_clear_color[3]) = (GLfloat)value[3];
+		}
+		STATE(dirty_bits) |= DIRTY_FBO | DIRTY_STATE;
+		return;
+	}
+	ERROR_RETURN(GL_INVALID_ENUM);
 }
 
 void mglClipControl(GLMContext ctx, GLenum origin, GLenum depth)
 {
-	// Clip control - no-op, use default clip control
-	(void)origin;
-	(void)depth;
+	if (origin != GL_LOWER_LEFT && origin != GL_UPPER_LEFT)
+	{
+		ERROR_RETURN(GL_INVALID_ENUM);
+		return;
+	}
+
+	if (depth != GL_NEGATIVE_ONE_TO_ONE && depth != GL_ZERO_TO_ONE)
+	{
+		ERROR_RETURN(GL_INVALID_ENUM);
+		return;
+	}
+
+	STATE(var.clip_origin) = origin;
+	STATE(var.clip_depth_mode) = depth;
+	STATE(dirty_bits) |= DIRTY_RENDER_STATE | DIRTY_PROGRAM;
 }
 
 void mglColorMaski(GLMContext ctx, GLuint index, GLboolean r, GLboolean g, GLboolean b, GLboolean a)
 {
-	// Indexed color mask - use global mask for simplicity
-	(void)index;
-	mglColorMask(ctx, r, g, b, a);
+	if (!ctx) {
+		return;
+	}
+
+	if (index >= MAX_COLOR_ATTACHMENTS) {
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	r = r ? GL_TRUE : GL_FALSE;
+	g = g ? GL_TRUE : GL_FALSE;
+	b = b ? GL_TRUE : GL_FALSE;
+	a = a ? GL_TRUE : GL_FALSE;
+
+	STATE(caps.use_color_mask[index]) = (r == GL_FALSE ||
+	                                     g == GL_FALSE ||
+	                                     b == GL_FALSE ||
+	                                     a == GL_FALSE) ? GL_TRUE : GL_FALSE;
+	STATE(var.color_writemask[index][0]) = r ? GL_TRUE : GL_FALSE;
+	STATE(var.color_writemask[index][1]) = g ? GL_TRUE : GL_FALSE;
+	STATE(var.color_writemask[index][2]) = b ? GL_TRUE : GL_FALSE;
+	STATE(var.color_writemask[index][3]) = a ? GL_TRUE : GL_FALSE;
+
+	// Color write masks are part of the Metal pipeline descriptor.
+	STATE(dirty_bits) |= DIRTY_RENDER_STATE | DIRTY_ALPHA_STATE;
 }
 
 void mglColorP3ui(GLMContext ctx, GLenum type, GLuint color)
 {
 	// Packed color - deprecated, no-op
+	(void)ctx;
 	(void)type;
 	(void)color;
 }
@@ -166,6 +902,7 @@ void mglColorP3ui(GLMContext ctx, GLenum type, GLuint color)
 void mglColorP3uiv(GLMContext ctx, GLenum type, const GLuint *color)
 {
 	// Packed color - deprecated, no-op
+	(void)ctx;
 	(void)type;
 	(void)color;
 }
@@ -173,6 +910,7 @@ void mglColorP3uiv(GLMContext ctx, GLenum type, const GLuint *color)
 void mglColorP4ui(GLMContext ctx, GLenum type, GLuint color)
 {
 	// Packed color - deprecated, no-op
+	(void)ctx;
 	(void)type;
 	(void)color;
 }
@@ -180,6 +918,7 @@ void mglColorP4ui(GLMContext ctx, GLenum type, GLuint color)
 void mglColorP4uiv(GLMContext ctx, GLenum type, const GLuint *color)
 {
 	// Packed color - deprecated, no-op
+	(void)ctx;
 	(void)type;
 	(void)color;
 }
@@ -261,6 +1000,7 @@ void mglCreateTransformFeedbacks(GLMContext ctx, GLsizei n, GLuint *ids)
 void mglDebugMessageCallback(GLMContext ctx, GLDEBUGPROC callback, const void *userParam)
 {
 	// Debug callback - no-op if debug infrastructure not available
+	(void)ctx;
 	(void)callback;
 	(void)userParam;
 }
@@ -268,6 +1008,7 @@ void mglDebugMessageCallback(GLMContext ctx, GLDEBUGPROC callback, const void *u
 void mglDebugMessageControl(GLMContext ctx, GLenum source, GLenum type, GLenum severity, GLsizei count, const GLuint *ids, GLboolean enabled)
 {
 	// Debug message control - no-op
+	(void)ctx;
 	(void)source;
 	(void)type;
 	(void)severity;
@@ -279,6 +1020,7 @@ void mglDebugMessageControl(GLMContext ctx, GLenum source, GLenum type, GLenum s
 void mglDebugMessageInsert(GLMContext ctx, GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar *buf)
 {
 	// Insert debug message - no-op
+	(void)ctx;
 	(void)source;
 	(void)type;
 	(void)id;
@@ -289,9 +1031,34 @@ void mglDebugMessageInsert(GLMContext ctx, GLenum source, GLenum type, GLuint id
 
 void mglDeleteQueries(GLMContext ctx, GLsizei n, const GLuint *ids)
 {
-	// Query deletion - no-op, basic stub
-	(void)n;
-	(void)ids;
+	if (n < 0)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+	if (!ids)
+		return;
+
+	for (GLsizei i = 0; i < n; i++)
+	{
+		QueryObject *q;
+		int slot;
+		if (ids[i] == 0)
+			continue;
+		q = mgl_find_query(ids[i]);
+		if (!q)
+			continue;
+		if (q->active)
+		{
+			STATE(error) = GL_INVALID_OPERATION;
+			continue;
+		}
+		slot = mgl_query_target_slot(q->target);
+		if (slot >= 0 && s_active_query_by_target[slot] == q->name)
+			s_active_query_by_target[slot] = 0;
+		deleteHashElement(&s_query_table, q->name);
+		free(q);
+	}
 }
 
 void mglDeleteTransformFeedbacks(GLMContext ctx, GLsizei n, const GLuint *ids)
@@ -326,17 +1093,37 @@ void mglDeleteTransformFeedbacks(GLMContext ctx, GLsizei n, const GLuint *ids)
 
 void mglDepthRangeArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLdouble *v)
 {
-	// Depth range array - use first value for global depth range
-	if (count > 0)
-		mglDepthRange(ctx, v[0], v[1]);
-	(void)first;
+	if (!mgl_validate_viewport_range(ctx, first, count))
+		return;
+	ERROR_CHECK_RETURN(count == 0 || v, GL_INVALID_VALUE);
+
+	// MGL tracks viewport/depth-range state for viewport 0. Indexed ranges that
+	// do not include 0 are retained for GL queries, but are not consumed by the
+	// current Metal draw path.
+	for (GLsizei i = 0; i < count; i++) {
+		GLuint index = first + (GLuint)i;
+		GLdouble n = v[i * 2 + 0];
+		GLdouble f = v[i * 2 + 1];
+		if (index == 0) {
+			mglDepthRange(ctx, n, f);
+		} else if (index < MGL_MAX_VIEWPORTS) {
+			ctx->state.depth_range_array[index][0] = n < 0.0 ? 0.0 : (n > 1.0 ? 1.0 : n);
+			ctx->state.depth_range_array[index][1] = f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f);
+			ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+		}
+	}
 }
 
 void mglDepthRangeIndexed(GLMContext ctx, GLuint index, GLdouble n, GLdouble f)
 {
-	// Indexed depth range - use global depth range
-	(void)index;
-	mglDepthRange(ctx, n, f);
+	ERROR_CHECK_RETURN(index < mgl_effective_max_viewports(ctx), GL_INVALID_VALUE);
+	if (index == 0) {
+		mglDepthRange(ctx, n, f);
+	} else if (index < MGL_MAX_VIEWPORTS) {
+		ctx->state.depth_range_array[index][0] = n < 0.0 ? 0.0 : (n > 1.0 ? 1.0 : n);
+		ctx->state.depth_range_array[index][1] = f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f);
+		ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+	}
 }
 
 void mglDepthRangef(GLMContext ctx, GLfloat n, GLfloat f)
@@ -347,6 +1134,7 @@ void mglDepthRangef(GLMContext ctx, GLfloat n, GLfloat f)
 void mglDrawTransformFeedback(GLMContext ctx, GLenum mode, GLuint id)
 {
 	// Draw from transform feedback - no-op for now
+	(void)ctx;
 	(void)mode;
 	(void)id;
 }
@@ -354,6 +1142,7 @@ void mglDrawTransformFeedback(GLMContext ctx, GLenum mode, GLuint id)
 void mglDrawTransformFeedbackInstanced(GLMContext ctx, GLenum mode, GLuint id, GLsizei instancecount)
 {
 	// Draw from transform feedback instanced - no-op for now
+	(void)ctx;
 	(void)mode;
 	(void)id;
 	(void)instancecount;
@@ -362,6 +1151,7 @@ void mglDrawTransformFeedbackInstanced(GLMContext ctx, GLenum mode, GLuint id, G
 void mglDrawTransformFeedbackStream(GLMContext ctx, GLenum mode, GLuint id, GLuint stream)
 {
 	// Draw from transform feedback stream - no-op for now
+	(void)ctx;
 	(void)mode;
 	(void)id;
 	(void)stream;
@@ -370,6 +1160,7 @@ void mglDrawTransformFeedbackStream(GLMContext ctx, GLenum mode, GLuint id, GLui
 void mglDrawTransformFeedbackStreamInstanced(GLMContext ctx, GLenum mode, GLuint id, GLuint stream, GLsizei instancecount)
 {
 	// Draw from transform feedback stream instanced - no-op for now
+	(void)ctx;
 	(void)mode;
 	(void)id;
 	(void)stream;
@@ -384,15 +1175,43 @@ void mglEndConditionalRender(GLMContext ctx)
 
 void mglEndQuery(GLMContext ctx, GLenum target)
 {
-	// End query - no-op
-	(void)target;
+	int slot;
+	QueryObject *q;
+	GLuint id;
+
+	slot = mgl_query_target_slot(target);
+	if (slot < 0)
+	{
+		STATE(error) = GL_INVALID_ENUM;
+		return;
+	}
+	id = s_active_query_by_target[slot];
+	if (id == 0)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return;
+	}
+	q = mgl_find_query(id);
+	if (!q)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return;
+	}
+
+	q->active = GL_FALSE;
+	q->available = GL_TRUE;
+	q->result = 1;
+	s_active_query_by_target[slot] = 0;
 }
 
 void mglEndQueryIndexed(GLMContext ctx, GLenum target, GLuint index)
 {
-	// End indexed query - no-op
-	(void)target;
-	(void)index;
+	if (index != 0)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+	mglEndQuery(ctx, target);
 }
 
 void mglEndTransformFeedback(GLMContext ctx)
@@ -409,9 +1228,20 @@ void mglEndTransformFeedback(GLMContext ctx)
 
 void mglGenQueries(GLMContext ctx, GLsizei n, GLuint *ids)
 {
-	// Generate query IDs - simple sequential IDs
+	if (n < 0)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+	if (!ids)
+		return;
+
+	mgl_init_query_table_if_needed();
 	for (GLsizei i = 0; i < n; i++)
-		ids[i] = i + 1;
+	{
+		ids[i] = getNewName(&s_query_table);
+		(void)mgl_get_query(ids[i]);
+	}
 }
 
 void mglGenTransformFeedbacks(GLMContext ctx, GLsizei n, GLuint *ids)
@@ -425,6 +1255,7 @@ void mglGenTransformFeedbacks(GLMContext ctx, GLsizei n, GLuint *ids)
 
 void mglGetActiveAtomicCounterBufferiv(GLMContext ctx, GLuint program, GLuint bufferIndex, GLenum pname, GLint *params)
 {
+	mgl_unimplemented(ctx, __FUNCTION__);
 	// Atomic counter buffers - return 0
 	(void)program; (void)bufferIndex; (void)pname;
 	if (params) *params = 0;
@@ -432,6 +1263,7 @@ void mglGetActiveAtomicCounterBufferiv(GLMContext ctx, GLuint program, GLuint bu
 
 void mglGetActiveSubroutineName(GLMContext ctx, GLuint program, GLenum shadertype, GLuint index, GLsizei bufSize, GLsizei *length, GLchar *name)
 {
+	mgl_unimplemented(ctx, __FUNCTION__);
 	// Subroutines - return empty string
 	(void)program; (void)shadertype; (void)index; (void)bufSize;
 	if (length) *length = 0;
@@ -440,6 +1272,7 @@ void mglGetActiveSubroutineName(GLMContext ctx, GLuint program, GLenum shadertyp
 
 void mglGetActiveSubroutineUniformName(GLMContext ctx, GLuint program, GLenum shadertype, GLuint index, GLsizei bufSize, GLsizei *length, GLchar *name)
 {
+	mgl_unimplemented(ctx, __FUNCTION__);
 	// Subroutine uniforms - return empty string
 	(void)program; (void)shadertype; (void)index; (void)bufSize;
 	if (length) *length = 0;
@@ -448,6 +1281,7 @@ void mglGetActiveSubroutineUniformName(GLMContext ctx, GLuint program, GLenum sh
 
 void mglGetActiveSubroutineUniformiv(GLMContext ctx, GLuint program, GLenum shadertype, GLuint index, GLenum pname, GLint *values)
 {
+	mgl_unimplemented(ctx, __FUNCTION__);
 	// Subroutine uniform parameters - return 0
 	(void)program; (void)shadertype; (void)index; (void)pname;
 	if (values) *values = 0;
@@ -455,20 +1289,30 @@ void mglGetActiveSubroutineUniformiv(GLMContext ctx, GLuint program, GLenum shad
 
 void mglGetBooleani_v(GLMContext ctx, GLenum target, GLuint index, GLboolean *data)
 {
-	// Indexed boolean - return false
-	(void)target; (void)index;
-	if (data) *data = GL_FALSE;
+	GLint tmp[4] = {0};
+	GLsizei count = (target == GL_COLOR_WRITEMASK || target == GL_VIEWPORT || target == GL_SCISSOR_BOX) ? 4 : 1;
+	if (target == GL_DEPTH_RANGE) {
+		count = 2;
+	}
+	ERROR_CHECK_RETURN(data, GL_INVALID_VALUE);
+	mglGetIntegeri_v(ctx, target, index, tmp);
+	for (GLsizei i = 0; i < count; i++) {
+		data[i] = (tmp[i] != 0) ? GL_TRUE : GL_FALSE;
+	}
 }
 
 void mglGetBufferParameteri64v(GLMContext ctx, GLenum target, GLenum pname, GLint64 *params)
 {
-	// Buffer parameter - return 0
-	(void)target; (void)pname;
-	if (params) *params = 0;
+	GLint tmp = 0;
+	if (!params)
+		return;
+	mglGetBufferParameteriv(ctx, target, pname, &tmp);
+	*params = (GLint64)tmp;
 }
 
 GLuint  mglGetDebugMessageLog(GLMContext ctx, GLuint count, GLsizei bufSize, GLenum *sources, GLenum *types, GLuint *ids, GLenum *severities, GLsizei *lengths, GLchar *messageLog)
 {
+	mgl_unimplemented(ctx, __FUNCTION__);
 	// No debug messages stored
 	(void)count;
 	(void)bufSize;
@@ -483,38 +1327,106 @@ GLuint  mglGetDebugMessageLog(GLMContext ctx, GLuint count, GLsizei bufSize, GLe
 
 void mglGetDoublei_v(GLMContext ctx, GLenum target, GLuint index, GLdouble *data)
 {
-	// Indexed double - return 0.0
-	(void)target; (void)index;
-	if (data) *data = 0.0;
+	ERROR_CHECK_RETURN(data, GL_INVALID_VALUE);
+	switch (target) {
+		case GL_VIEWPORT:
+			ERROR_CHECK_RETURN(index < mgl_effective_max_viewports(ctx), GL_INVALID_VALUE);
+			for (int i = 0; i < 4; i++) {
+				data[i] = (GLdouble)ctx->state.viewport_array[index][i];
+			}
+			return;
+		case GL_SCISSOR_BOX:
+			ERROR_CHECK_RETURN(index < mgl_effective_max_viewports(ctx), GL_INVALID_VALUE);
+			for (int i = 0; i < 4; i++) {
+				data[i] = (GLdouble)ctx->state.scissor_box_array[index][i];
+			}
+			return;
+		case GL_DEPTH_RANGE:
+			ERROR_CHECK_RETURN(index < mgl_effective_max_viewports(ctx), GL_INVALID_VALUE);
+			data[0] = ctx->state.depth_range_array[index][0];
+			data[1] = ctx->state.depth_range_array[index][1];
+			return;
+		default:
+			break;
+	}
+
+	GLint tmp[4] = {0};
+	GLsizei count = (target == GL_COLOR_WRITEMASK) ? 4 : 1;
+	mglGetIntegeri_v(ctx, target, index, tmp);
+	for (GLsizei i = 0; i < count; i++) {
+		data[i] = (GLdouble)tmp[i];
+	}
 }
 
 void mglGetFloati_v(GLMContext ctx, GLenum target, GLuint index, GLfloat *data)
 {
-	// Indexed float - return 0.0
-	(void)target; (void)index;
-	if (data) *data = 0.0f;
+	ERROR_CHECK_RETURN(data, GL_INVALID_VALUE);
+	switch (target) {
+		case GL_VIEWPORT:
+			ERROR_CHECK_RETURN(index < mgl_effective_max_viewports(ctx), GL_INVALID_VALUE);
+			for (int i = 0; i < 4; i++) {
+				data[i] = ctx->state.viewport_array[index][i];
+			}
+			return;
+		case GL_SCISSOR_BOX:
+			ERROR_CHECK_RETURN(index < mgl_effective_max_viewports(ctx), GL_INVALID_VALUE);
+			for (int i = 0; i < 4; i++) {
+				data[i] = (GLfloat)ctx->state.scissor_box_array[index][i];
+			}
+			return;
+		case GL_DEPTH_RANGE:
+			ERROR_CHECK_RETURN(index < mgl_effective_max_viewports(ctx), GL_INVALID_VALUE);
+			data[0] = (GLfloat)ctx->state.depth_range_array[index][0];
+			data[1] = (GLfloat)ctx->state.depth_range_array[index][1];
+			return;
+		default:
+			break;
+	}
+
+	GLint tmp[4] = {0};
+	GLsizei count = (target == GL_COLOR_WRITEMASK) ? 4 : 1;
+	mglGetIntegeri_v(ctx, target, index, tmp);
+	for (GLsizei i = 0; i < count; i++) {
+		data[i] = (GLfloat)tmp[i];
+	}
 }
 
 GLint  mglGetFragDataIndex(GLMContext ctx, GLuint program, const GLchar *name)
 {
-	// Return fragment output index
-	(void)program;
-	(void)name;
-	return 0;
+	GLint location = mglGetFragDataLocation(ctx, program, name);
+	return (location >= 0) ? 0 : -1;
 }
 
 GLint  mglGetFragDataLocation(GLMContext ctx, GLuint program, const GLchar *name)
 {
-	// Return fragment output location - default to 0
-	(void)program;
-	(void)name;
-	return 0;
+	Program *pptr;
+	SpirvResource *res;
+
+	if (!name)
+		return -1;
+
+	pptr = findProgram(ctx, program);
+	if (!pptr)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return -1;
+	}
+	if (!pptr->linked_glsl_program)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return -1;
+	}
+
+	int output_type = _STAGE_OUTPUT_RES;
+	res = mgl_program_resource_find_by_name(pptr, &output_type, 1, name, NULL, NULL, NULL);
+	return res ? (GLint)res->location : -1;
 }
 
 
 GLenum  mglGetGraphicsResetStatus(GLMContext ctx)
 {
 	// No robust context support - always return no error
+	(void)ctx;
 	return GL_NO_ERROR;
 }
 
@@ -534,16 +1446,34 @@ void mglGetMultisamplefv(GLMContext ctx, GLenum pname, GLuint index, GLfloat *va
 
 void mglGetObjectLabel(GLMContext ctx, GLenum identifier, GLuint name, GLsizei bufSize, GLsizei *length, GLchar *label)
 {
-	// No labels stored
-	(void)identifier;
-	(void)name;
-	if (length) *length = 0;
-	if (label && bufSize > 0) label[0] = '\0';
+	const char *stored_label = "";
+	if (ctx && identifier == GL_TEXTURE && name != 0) {
+		Texture *tex = findTexture(ctx, name);
+		if (tex && tex->debug_label[0] != '\0') {
+			stored_label = tex->debug_label;
+		}
+	}
+
+	GLsizei stored_len = (GLsizei)strlen(stored_label);
+	if (length) {
+		*length = stored_len;
+	}
+	if (label && bufSize > 0) {
+		GLsizei copy_len = stored_len;
+		if (copy_len >= bufSize) {
+			copy_len = bufSize - 1;
+		}
+		if (copy_len > 0) {
+			memcpy(label, stored_label, (size_t)copy_len);
+		}
+		label[copy_len] = '\0';
+	}
 }
 
 void mglGetObjectPtrLabel(GLMContext ctx, const void *ptr, GLsizei bufSize, GLsizei *length, GLchar *label)
 {
 	// No labels stored
+	(void)ctx;
 	(void)ptr;
 	if (length) *length = 0;
 	if (label && bufSize > 0) label[0] = '\0';
@@ -553,19 +1483,84 @@ void mglGetProgramBinary(GLMContext ctx, GLuint program, GLsizei bufSize, GLsize
 {
 	// Program binary not supported
 	(void)program; (void)bufSize; (void)binary;
+	STATE(error) = GL_INVALID_OPERATION;
 	if (length) *length = 0;
 	if (binaryFormat) *binaryFormat = 0;
 }
 
 void mglGetProgramInterfaceiv(GLMContext ctx, GLuint program, GLenum programInterface, GLenum pname, GLint *params)
 {
-	// Program interface query - return 0
-	(void)program; (void)programInterface; (void)pname;
-	if (params) *params = 0;
+	Program *pptr;
+	int res_types[6];
+	int res_type_count;
+
+	if (!params)
+		return;
+
+	pptr = findProgram(ctx, program);
+	if (!pptr)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	res_type_count = mgl_program_interface_to_spvc_list(programInterface, res_types, 6);
+	if (res_type_count <= 0)
+	{
+		STATE(error) = GL_INVALID_ENUM;
+		return;
+	}
+
+	switch (pname)
+	{
+		case GL_ACTIVE_RESOURCES:
+			*params = (programInterface == GL_UNIFORM)
+				? mglProgramActiveUniformCount(pptr)
+				: mgl_program_resource_count(pptr, res_types, res_type_count);
+			break;
+		case GL_MAX_NAME_LENGTH:
+		{
+			if (programInterface == GL_UNIFORM)
+			{
+				*params = mglProgramActiveUniformMaxNameLength(pptr);
+				break;
+			}
+
+			GLint max_len = 1;
+			for (int t = 0; t < res_type_count; t++)
+			{
+				int res_type = res_types[t];
+				for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++)
+				{
+					if (res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT && stage != _VERTEX_SHADER)
+						continue;
+					if (res_type == SPVC_RESOURCE_TYPE_STAGE_OUTPUT && stage != _FRAGMENT_SHADER)
+						continue;
+					GLuint count = pptr->spirv_resources_list[stage][res_type].count;
+					for (GLuint i = 0; i < count; i++)
+					{
+						if (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER &&
+						    mgl_program_uniform_block_seen_before(pptr, stage, i))
+							continue;
+						SpirvResource *res = &pptr->spirv_resources_list[stage][res_type].list[i];
+						GLint len = (GLint)(res->name ? strlen(res->name) + 1 : 1);
+						if (len > max_len)
+							max_len = len;
+					}
+				}
+			}
+			*params = max_len;
+			break;
+		}
+		default:
+			STATE(error) = GL_INVALID_ENUM;
+			break;
+	}
 }
 
 void mglGetProgramPipelineInfoLog(GLMContext ctx, GLuint pipeline, GLsizei bufSize, GLsizei *length, GLchar *infoLog)
 {
+	mgl_unimplemented(ctx, __FUNCTION__);
 	// Pipeline info log - return empty
 	(void)pipeline;
 	if (length) *length = 0;
@@ -574,6 +1569,7 @@ void mglGetProgramPipelineInfoLog(GLMContext ctx, GLuint pipeline, GLsizei bufSi
 
 void mglGetProgramPipelineiv(GLMContext ctx, GLuint pipeline, GLenum pname, GLint *params)
 {
+	mgl_unimplemented(ctx, __FUNCTION__);
 	// Get program pipeline parameters - return 0
 	(void)pipeline; (void)pname;
 	if (params) *params = 0;
@@ -581,106 +1577,411 @@ void mglGetProgramPipelineiv(GLMContext ctx, GLuint pipeline, GLenum pname, GLin
 
 GLuint  mglGetProgramResourceIndex(GLMContext ctx, GLuint program, GLenum programInterface, const GLchar *name)
 {
-	// Program resource index - return 0 (not found)
-	(void)program; (void)programInterface; (void)name;
-	return 0;
+	Program *pptr;
+	int res_types[6];
+	int res_type_count;
+	int found_type = -1;
+	int found_stage = -1;
+	GLuint index = GL_INVALID_INDEX;
+
+	if (!name)
+		return GL_INVALID_INDEX;
+
+	pptr = findProgram(ctx, program);
+	if (!pptr)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return GL_INVALID_INDEX;
+	}
+	res_type_count = mgl_program_interface_to_spvc_list(programInterface, res_types, 6);
+	if (res_type_count <= 0)
+	{
+		STATE(error) = GL_INVALID_ENUM;
+		return GL_INVALID_INDEX;
+	}
+
+	if (programInterface == GL_UNIFORM)
+	{
+		GLint active_index = mglProgramActiveUniformIndexByName(pptr, name);
+		return (active_index >= 0) ? (GLuint)active_index : GL_INVALID_INDEX;
+	}
+
+	if (mgl_program_resource_find_by_name(pptr, res_types, res_type_count, name, &index, &found_stage, &found_type))
+	{
+		if (strstr(name, "CloudFaces"))
+			fprintf(stderr, "MGL REFLECT ResourceIndex program=%u iface=0x%x name=%s -> index=%u type=%d stage=%d\n",
+			        program, programInterface, name, index, found_type, found_stage);
+		return index;
+	}
+	if (strstr(name, "CloudFaces"))
+		fprintf(stderr, "MGL REFLECT ResourceIndex MISS program=%u iface=0x%x name=%s\n",
+		        program, programInterface, name);
+	return GL_INVALID_INDEX;
 }
 
 GLint  mglGetProgramResourceLocation(GLMContext ctx, GLuint program, GLenum programInterface, const GLchar *name)
 {
-	// Program resource location - return -1 (not found)
-	(void)program; (void)programInterface; (void)name;
+	Program *pptr;
+	SpirvResource *res;
+	int res_types[6];
+	int res_type_count;
+	int found_type = -1;
+	int found_stage = -1;
+
+	if (!name)
+		return -1;
+
+	pptr = findProgram(ctx, program);
+	if (!pptr)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return -1;
+	}
+	res_type_count = mgl_program_interface_to_spvc_list(programInterface, res_types, 6);
+	if (res_type_count <= 0)
+	{
+		STATE(error) = GL_INVALID_ENUM;
+		return -1;
+	}
+
+	if (programInterface == GL_UNIFORM)
+	{
+		GLint active_index = mglProgramActiveUniformIndexByName(pptr, name);
+		if (active_index < 0)
+			return -1;
+		res = mglProgramActiveUniformAt(pptr, (GLuint)active_index, NULL, NULL);
+		return mgl_program_uniform_resource_location(ctx, program, res);
+	}
+
+	res = mgl_program_resource_find_by_name(pptr, res_types, res_type_count, name, NULL, &found_stage, &found_type);
+	if (res)
+	{
+		GLint location = (res->location != 0xffffffffu) ? (GLint)res->location : (GLint)res->gl_binding;
+		if (strstr(name, "CloudFaces"))
+			fprintf(stderr, "MGL REFLECT ResourceLocation program=%u iface=0x%x name=%s -> loc=%d glBinding=%u metalBinding=%u type=%d stage=%d dim=%u\n",
+			        program, programInterface, name, location, res->gl_binding, res->binding, found_type, found_stage, res->image_dim);
+		return location;
+	}
+	if (strstr(name, "CloudFaces"))
+		fprintf(stderr, "MGL REFLECT ResourceLocation MISS program=%u iface=0x%x name=%s\n",
+		        program, programInterface, name);
 	return -1;
 }
 
 GLint  mglGetProgramResourceLocationIndex(GLMContext ctx, GLuint program, GLenum programInterface, const GLchar *name)
 {
-	// Program resource location index - return -1 (not found)
-	(void)program; (void)programInterface; (void)name;
-	return -1;
+	GLint location = mglGetProgramResourceLocation(ctx, program, programInterface, name);
+	return (location >= 0) ? 0 : -1;
 }
 
 void mglGetProgramResourceName(GLMContext ctx, GLuint program, GLenum programInterface, GLuint index, GLsizei bufSize, GLsizei *length, GLchar *name)
 {
-	// TODO: Implement
-	(void)ctx;
+	Program *pptr;
+	SpirvResource *res;
+	int res_types[6];
+	int res_type_count;
+	const char *src;
+	GLsizei src_len;
+	GLsizei copy_len;
+
+	if (length)
+		*length = 0;
+	if (name && bufSize > 0)
+		name[0] = '\0';
+	if (bufSize < 0)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	pptr = findProgram(ctx, program);
+	if (!pptr)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+	res_type_count = mgl_program_interface_to_spvc_list(programInterface, res_types, 6);
+	if (res_type_count <= 0)
+	{
+		STATE(error) = GL_INVALID_ENUM;
+		return;
+	}
+
+	if (programInterface == GL_UNIFORM)
+	{
+		res = mglProgramActiveUniformAt(pptr, index, NULL, NULL);
+		if (!res)
+		{
+			STATE(error) = GL_INVALID_VALUE;
+			return;
+		}
+
+		mglProgramCopyActiveUniformName(res, bufSize, length, name);
+		return;
+	}
+
+	res = mgl_program_resource_at_index(pptr, res_types, res_type_count, index, NULL, NULL);
+	if (!res)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	src = res->name ? res->name : "";
+	src_len = (GLsizei)strlen(src);
+	if (length)
+		*length = src_len;
+	if (name && bufSize > 0)
+	{
+		copy_len = (src_len < (bufSize - 1)) ? src_len : (bufSize - 1);
+		memcpy(name, src, copy_len);
+		name[copy_len] = '\0';
+	}
 }
 
 void mglGetProgramResourceiv(GLMContext ctx, GLuint program, GLenum programInterface, GLuint index, GLsizei propCount, const GLenum *props, GLsizei count, GLsizei *length, GLint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+	Program *pptr;
+	SpirvResource *res;
+	int stage = 0;
+	int res_type = -1;
+	int res_types[6];
+	int res_type_count;
+	GLsizei n;
+
+	if (length)
+		*length = 0;
+	if (propCount < 0 || count < 0)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+	if (!props || !params)
+	{
+		if (propCount > 0)
+			STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	pptr = findProgram(ctx, program);
+	if (!pptr)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+	res_type_count = mgl_program_interface_to_spvc_list(programInterface, res_types, 6);
+	if (res_type_count <= 0)
+	{
+		STATE(error) = GL_INVALID_ENUM;
+		return;
+	}
+
+	if (programInterface == GL_UNIFORM)
+	{
+		mgl_get_program_uniform_resourceiv(ctx,
+		                                   program,
+		                                   pptr,
+		                                   index,
+		                                   propCount,
+		                                   props,
+		                                   count,
+		                                   length,
+		                                   params);
+		return;
+	}
+
+	res = mgl_program_resource_at_index(pptr, res_types, res_type_count, index, &stage, &res_type);
+	if (!res)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	n = (propCount < count) ? propCount : count;
+	for (GLsizei i = 0; i < n; i++)
+	{
+		switch (props[i])
+		{
+			case GL_NAME_LENGTH: params[i] = (GLint)(res->name ? strlen(res->name) + 1 : 1); break;
+			case GL_TYPE: params[i] = mgl_program_resource_gl_type(res, res_type); break;
+			case GL_ARRAY_SIZE: params[i] = 1; break;
+			case GL_OFFSET: params[i] = -1; break;
+			case GL_BLOCK_INDEX: params[i] = -1; break;
+			case GL_ARRAY_STRIDE: params[i] = 0; break;
+			case GL_MATRIX_STRIDE: params[i] = 0; break;
+			case GL_IS_ROW_MAJOR: params[i] = 0; break;
+			case GL_ATOMIC_COUNTER_BUFFER_INDEX: params[i] = -1; break;
+			case GL_BUFFER_BINDING: params[i] = (GLint)res->gl_binding; break;
+			case GL_BUFFER_DATA_SIZE:
+				params[i] = (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER)
+					? (GLint)mgl_program_uniform_block_required_size(pptr, res)
+					: (GLint)mgl_round_up_16(res->required_size);
+				break;
+			case GL_NUM_ACTIVE_VARIABLES: params[i] = 0; break;
+			case GL_REFERENCED_BY_VERTEX_SHADER:
+				params[i] = (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER)
+					? mgl_program_uniform_block_referenced_by_stage(pptr, res, _VERTEX_SHADER)
+					: ((stage == _VERTEX_SHADER) ? GL_TRUE : GL_FALSE);
+				break;
+			case GL_REFERENCED_BY_FRAGMENT_SHADER:
+				params[i] = (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER)
+					? mgl_program_uniform_block_referenced_by_stage(pptr, res, _FRAGMENT_SHADER)
+					: ((stage == _FRAGMENT_SHADER) ? GL_TRUE : GL_FALSE);
+				break;
+			case GL_REFERENCED_BY_GEOMETRY_SHADER:
+				params[i] = (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER)
+					? mgl_program_uniform_block_referenced_by_stage(pptr, res, _GEOMETRY_SHADER)
+					: ((stage == _GEOMETRY_SHADER) ? GL_TRUE : GL_FALSE);
+				break;
+			case GL_REFERENCED_BY_TESS_CONTROL_SHADER:
+				params[i] = (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER)
+					? mgl_program_uniform_block_referenced_by_stage(pptr, res, _TESS_CONTROL_SHADER)
+					: ((stage == _TESS_CONTROL_SHADER) ? GL_TRUE : GL_FALSE);
+				break;
+			case GL_REFERENCED_BY_TESS_EVALUATION_SHADER:
+				params[i] = (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER)
+					? mgl_program_uniform_block_referenced_by_stage(pptr, res, _TESS_EVALUATION_SHADER)
+					: ((stage == _TESS_EVALUATION_SHADER) ? GL_TRUE : GL_FALSE);
+				break;
+			case GL_REFERENCED_BY_COMPUTE_SHADER:
+				params[i] = (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER)
+					? mgl_program_uniform_block_referenced_by_stage(pptr, res, _COMPUTE_SHADER)
+					: ((stage == _COMPUTE_SHADER) ? GL_TRUE : GL_FALSE);
+				break;
+			case GL_LOCATION: params[i] = (GLint)res->location; break;
+			case GL_LOCATION_INDEX: params[i] = 0; break;
+			default:
+				STATE(error) = GL_INVALID_ENUM;
+				return;
+		}
+	}
+	if (length)
+		*length = n;
 }
 
 void mglGetProgramStageiv(GLMContext ctx, GLuint program, GLenum shadertype, GLenum pname, GLint *values)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetQueryBufferObjecti64v(GLMContext ctx, GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
 {
-	// TODO: Implement
-	(void)ctx;
+	(void)id; (void)buffer; (void)pname; (void)offset;
+	STATE(error) = GL_INVALID_OPERATION;
 }
 
 void mglGetQueryBufferObjectiv(GLMContext ctx, GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
 {
-	// TODO: Implement
-	(void)ctx;
+	(void)id; (void)buffer; (void)pname; (void)offset;
+	STATE(error) = GL_INVALID_OPERATION;
 }
 
 void mglGetQueryBufferObjectui64v(GLMContext ctx, GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
 {
-	// TODO: Implement
-	(void)ctx;
+	(void)id; (void)buffer; (void)pname; (void)offset;
+	STATE(error) = GL_INVALID_OPERATION;
 }
 
 void mglGetQueryBufferObjectuiv(GLMContext ctx, GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
 {
-	// TODO: Implement
-	(void)ctx;
+	(void)id; (void)buffer; (void)pname; (void)offset;
+	STATE(error) = GL_INVALID_OPERATION;
 }
 
 void mglGetQueryIndexediv(GLMContext ctx, GLenum target, GLuint index, GLenum pname, GLint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+	if (index != 0)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+	mglGetQueryiv(ctx, target, pname, params);
 }
 
 void mglGetQueryObjecti64v(GLMContext ctx, GLuint id, GLenum pname, GLint64 *params)
 {
-	// TODO: Implement
-	(void)ctx;
+	QueryObject *q = mgl_find_query(id);
+	if (!params)
+		return;
+	if (!q)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return;
+	}
+	if (pname == GL_QUERY_RESULT_AVAILABLE)
+		*params = q->available ? 1 : 0;
+	else if (pname == GL_QUERY_RESULT)
+		*params = (GLint64)(q->available ? q->result : 0);
+	else
+		STATE(error) = GL_INVALID_ENUM;
 }
 
 void mglGetQueryObjectiv(GLMContext ctx, GLuint id, GLenum pname, GLint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+	GLint64 val = 0;
+	if (!params)
+		return;
+	mglGetQueryObjecti64v(ctx, id, pname, &val);
+	*params = (GLint)val;
 }
 
 void mglGetQueryObjectui64v(GLMContext ctx, GLuint id, GLenum pname, GLuint64 *params)
 {
-	// TODO: Implement
-	(void)ctx;
+	QueryObject *q = mgl_find_query(id);
+	if (!params)
+		return;
+	if (!q)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return;
+	}
+	if (pname == GL_QUERY_RESULT_AVAILABLE)
+		*params = q->available ? 1u : 0u;
+	else if (pname == GL_QUERY_RESULT)
+		*params = q->available ? q->result : 0u;
+	else
+		STATE(error) = GL_INVALID_ENUM;
 }
 
 void mglGetQueryObjectuiv(GLMContext ctx, GLuint id, GLenum pname, GLuint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+	GLuint64 val = 0;
+	if (!params)
+		return;
+	mglGetQueryObjectui64v(ctx, id, pname, &val);
+	*params = (GLuint)val;
 }
 
 void mglGetQueryiv(GLMContext ctx, GLenum target, GLenum pname, GLint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+	int slot = mgl_query_target_slot(target);
+	if (!params)
+		return;
+	if (slot < 0)
+	{
+		STATE(error) = GL_INVALID_ENUM;
+		return;
+	}
+
+	switch (pname)
+	{
+		case GL_CURRENT_QUERY:
+			*params = (GLint)s_active_query_by_target[slot];
+			break;
+		case GL_QUERY_COUNTER_BITS:
+			*params = (target == GL_TIME_ELAPSED) ? 64 : 32;
+			break;
+		default:
+			STATE(error) = GL_INVALID_ENUM;
+			break;
+	}
 }
 
 void mglGetShaderPrecisionFormat(GLMContext ctx, GLenum shadertype, GLenum precisiontype, GLint *range, GLint *precision)
 {
 	// Return shader precision format - full precision for all types
+	(void)ctx;
 	(void)shadertype;
 	(void)precisiontype;
 	if (range) {
@@ -694,148 +1995,150 @@ void mglGetShaderPrecisionFormat(GLMContext ctx, GLenum shadertype, GLenum preci
 
 GLuint mglGetSubroutineIndex(GLMContext ctx, GLuint program, GLenum shadertype, const GLchar *name)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 	return 0;
 }
 
 GLint mglGetSubroutineUniformLocation(GLMContext ctx, GLuint program, GLenum shadertype, const GLchar *name)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 	return 0;
 }
 void mglGetTransformFeedbackVarying(GLMContext ctx, GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLsizei *size, GLenum *type, GLchar *name)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetTransformFeedbacki64_v(GLMContext ctx, GLuint xfb, GLenum pname, GLuint index, GLint64 *param)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetTransformFeedbacki_v(GLMContext ctx, GLuint xfb, GLenum pname, GLuint index, GLint *param)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetTransformFeedbackiv(GLMContext ctx, GLuint xfb, GLenum pname, GLint *param)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetUniformSubroutineuiv(GLMContext ctx, GLenum shadertype, GLint location, GLuint *params)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetUniformdv(GLMContext ctx, GLuint program, GLint location, GLdouble *params)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetUniformuiv(GLMContext ctx, GLuint program, GLint location, GLuint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+	GLint tmp = 0;
+	if (!params)
+		return;
+	mglGetUniformiv(ctx, program, location, &tmp);
+	*params = (GLuint)tmp;
 }
 
 void mglGetVertexAttribIiv(GLMContext ctx, GLuint index, GLenum pname, GLint *params)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetVertexAttribIuiv(GLMContext ctx, GLuint index, GLenum pname, GLuint *params)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetVertexAttribLdv(GLMContext ctx, GLuint index, GLenum pname, GLdouble *params)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnMapdv(GLMContext ctx, GLenum target, GLenum query, GLsizei bufSize, GLdouble *v)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnMapfv(GLMContext ctx, GLenum target, GLenum query, GLsizei bufSize, GLfloat *v)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnMapiv(GLMContext ctx, GLenum target, GLenum query, GLsizei bufSize, GLint *v)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnPixelMapfv(GLMContext ctx, GLenum map, GLsizei bufSize, GLfloat *values)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnPixelMapuiv(GLMContext ctx, GLenum map, GLsizei bufSize, GLuint *values)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnPixelMapusv(GLMContext ctx, GLenum map, GLsizei bufSize, GLushort *values)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnTexImage(GLMContext ctx, GLenum target, GLint level, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnUniformdv(GLMContext ctx, GLuint program, GLint location, GLsizei bufSize, GLdouble *params)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnUniformfv(GLMContext ctx, GLuint program, GLint location, GLsizei bufSize, GLfloat *params)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnUniformiv(GLMContext ctx, GLuint program, GLint location, GLsizei bufSize, GLint *params)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglGetnUniformuiv(GLMContext ctx, GLuint program, GLint location, GLsizei bufSize, GLuint *params)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 GLboolean mglIsQuery(GLMContext ctx, GLuint id)
 {
-	// TODO: Implement
 	(void)ctx;
-	return GL_FALSE;
+	return mgl_find_query(id) ? GL_TRUE : GL_FALSE;
 }
 
 GLboolean mglIsTransformFeedback(GLMContext ctx, GLuint id)
@@ -847,45 +2150,83 @@ GLboolean mglIsTransformFeedback(GLMContext ctx, GLuint id)
 void mglMinSampleShading(GLMContext ctx, GLfloat value)
 {
 	// Set minimum sample shading - no-op
+	(void)ctx;
 	(void)value;
 }
 
 void mglMultiDrawArraysIndirectCount(GLMContext ctx, GLenum mode, const void *indirect, GLintptr drawcount, GLsizei maxdrawcount, GLsizei stride)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglMultiDrawElementsIndirectCount(GLMContext ctx, GLenum mode, GLenum type, const void *indirect, GLintptr drawcount, GLsizei maxdrawcount, GLsizei stride)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglNormalP3ui(GLMContext ctx, GLenum type, GLuint coords)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglNormalP3uiv(GLMContext ctx, GLenum type, const GLuint *coords)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglObjectLabel(GLMContext ctx, GLenum identifier, GLuint name, GLsizei length, const GLchar *label)
 {
-	// Object label - no-op
-	(void)identifier;
-	(void)name;
-	(void)length;
-	(void)label;
+	if (!ctx) {
+		return;
+	}
+
+	if (identifier != GL_TEXTURE) {
+		/* Keep unsupported labels non-fatal; they are diagnostics only. */
+		return;
+	}
+
+	if (name == 0) {
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	Texture *tex = findTexture(ctx, name);
+	if (!tex) {
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	size_t max_len = sizeof(tex->debug_label) - 1u;
+	size_t copy_len = 0u;
+	if (label) {
+		if (length < 0) {
+			copy_len = strnlen(label, max_len);
+		} else {
+			copy_len = (size_t)length;
+			if (copy_len > max_len) {
+				copy_len = max_len;
+			}
+		}
+		if (copy_len > 0u) {
+			memcpy(tex->debug_label, label, copy_len);
+		}
+	}
+	tex->debug_label[copy_len] = '\0';
+	mglTraceLogExternal("OBJECT_LABEL texture=%u label=\"%s\" length=%d stored=%zu",
+	                    name,
+	                    tex->debug_label,
+	                    length,
+	                    copy_len);
 }
 
 void mglObjectPtrLabel(GLMContext ctx, const void *ptr, GLsizei length, const GLchar *label)
 {
 	// Object ptr label - no-op
+	(void)ctx;
 	(void)ptr;
 	(void)length;
 	(void)label;
@@ -893,13 +2234,13 @@ void mglObjectPtrLabel(GLMContext ctx, const void *ptr, GLsizei length, const GL
 
 void mglPatchParameterfv(GLMContext ctx, GLenum pname, const GLfloat *values)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglPatchParameteri(GLMContext ctx, GLenum pname, GLint value)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
@@ -916,346 +2257,149 @@ void mglPauseTransformFeedback(GLMContext ctx)
 
 void mglPolygonOffsetClamp(GLMContext ctx, GLfloat factor, GLfloat units, GLfloat clamp)
 {
-	// TODO: Implement
-	(void)ctx;
+	(void)clamp;
+	mglPolygonOffset(ctx, factor, units);
 }
 
 void mglPopDebugGroup(GLMContext ctx)
 {
 	// Pop debug group - no-op
+	(void)ctx;
 }
 
 void mglPrimitiveRestartIndex(GLMContext ctx, GLuint index)
 {
-	// Set primitive restart index - no-op
-	(void)index;
+	STATE(var.primitive_restart_index) = index;
+	STATE(dirty_bits) |= DIRTY_RENDER_STATE;
 }
 
 void mglProgramBinary(GLMContext ctx, GLuint program, GLenum binaryFormat, const void *binary, GLsizei length)
 {
-	// TODO: Implement
-	(void)ctx;
+	(void)program; (void)binaryFormat; (void)binary; (void)length;
+	STATE(error) = GL_INVALID_OPERATION;
 }
 
 void mglProgramParameteri(GLMContext ctx, GLuint program, GLenum pname, GLint value)
 {
-	// TODO: Implement
-	(void)ctx;
+	(void)ctx; (void)program; (void)pname; (void)value;
+	/* no-op: program binary hints ignored */
 }
 
-void mglProgramUniform1d(GLMContext ctx, GLuint program, GLint location, GLdouble v0)
+static GLboolean mgl_program_uniform_begin(GLMContext ctx, GLuint program, Program **saved_program)
 {
-	// TODO: Implement
-	(void)ctx;
+	Program *target;
+
+	if (!saved_program)
+		return GL_FALSE;
+
+	target = findProgram(ctx, program);
+	if (!target)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return GL_FALSE;
+	}
+	if (!target->linked_glsl_program)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return GL_FALSE;
+	}
+
+	*saved_program = STATE(program);
+	if (STATE(program) != target)
+		mglUseProgram(ctx, program);
+	return GL_TRUE;
 }
 
-void mglProgramUniform1dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value)
+static void mgl_program_uniform_end(GLMContext ctx, Program *saved_program)
 {
-	// TODO: Implement
-	(void)ctx;
+	if (STATE(program) != saved_program)
+	{
+		GLuint restore_program = saved_program ? saved_program->name : 0;
+		mglUseProgram(ctx, restore_program);
+	}
 }
 
-void mglProgramUniform1f(GLMContext ctx, GLuint program, GLint location, GLfloat v0)
-{
-	// TODO: Implement
-	(void)ctx;
+#define DEFINE_PROGRAM_UNIFORM_FORWARD(_suffix, _decl, ...) \
+void mglProgramUniform##_suffix _decl \
+{ \
+	Program *saved_program = NULL; \
+	if (!mgl_program_uniform_begin(ctx, program, &saved_program)) \
+		return; \
+	mglUniform##_suffix(ctx, __VA_ARGS__); \
+	mgl_program_uniform_end(ctx, saved_program); \
 }
 
-void mglProgramUniform1fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
+DEFINE_PROGRAM_UNIFORM_FORWARD(1d, (GLMContext ctx, GLuint program, GLint location, GLdouble v0), location, v0)
+DEFINE_PROGRAM_UNIFORM_FORWARD(1dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(1f, (GLMContext ctx, GLuint program, GLint location, GLfloat v0), location, v0)
+DEFINE_PROGRAM_UNIFORM_FORWARD(1fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(1i, (GLMContext ctx, GLuint program, GLint location, GLint v0), location, v0)
+DEFINE_PROGRAM_UNIFORM_FORWARD(1iv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(1ui, (GLMContext ctx, GLuint program, GLint location, GLuint v0), location, v0)
+DEFINE_PROGRAM_UNIFORM_FORWARD(1uiv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value), location, count, value)
 
-void mglProgramUniform1i(GLMContext ctx, GLuint program, GLint location, GLint v0)
-{
-	// TODO: Implement
-	(void)ctx;
-}
+DEFINE_PROGRAM_UNIFORM_FORWARD(2d, (GLMContext ctx, GLuint program, GLint location, GLdouble v0, GLdouble v1), location, v0, v1)
+DEFINE_PROGRAM_UNIFORM_FORWARD(2dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(2f, (GLMContext ctx, GLuint program, GLint location, GLfloat v0, GLfloat v1), location, v0, v1)
+DEFINE_PROGRAM_UNIFORM_FORWARD(2fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(2i, (GLMContext ctx, GLuint program, GLint location, GLint v0, GLint v1), location, v0, v1)
+DEFINE_PROGRAM_UNIFORM_FORWARD(2iv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(2ui, (GLMContext ctx, GLuint program, GLint location, GLuint v0, GLuint v1), location, v0, v1)
+DEFINE_PROGRAM_UNIFORM_FORWARD(2uiv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value), location, count, value)
 
-void mglProgramUniform1iv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
+DEFINE_PROGRAM_UNIFORM_FORWARD(3d, (GLMContext ctx, GLuint program, GLint location, GLdouble v0, GLdouble v1, GLdouble v2), location, v0, v1, v2)
+DEFINE_PROGRAM_UNIFORM_FORWARD(3dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(3f, (GLMContext ctx, GLuint program, GLint location, GLfloat v0, GLfloat v1, GLfloat v2), location, v0, v1, v2)
+DEFINE_PROGRAM_UNIFORM_FORWARD(3fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(3i, (GLMContext ctx, GLuint program, GLint location, GLint v0, GLint v1, GLint v2), location, v0, v1, v2)
+DEFINE_PROGRAM_UNIFORM_FORWARD(3iv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(3ui, (GLMContext ctx, GLuint program, GLint location, GLuint v0, GLuint v1, GLuint v2), location, v0, v1, v2)
+DEFINE_PROGRAM_UNIFORM_FORWARD(3uiv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value), location, count, value)
 
-void mglProgramUniform1ui(GLMContext ctx, GLuint program, GLint location, GLuint v0)
-{
-	// TODO: Implement
-	(void)ctx;
-}
+DEFINE_PROGRAM_UNIFORM_FORWARD(4d, (GLMContext ctx, GLuint program, GLint location, GLdouble v0, GLdouble v1, GLdouble v2, GLdouble v3), location, v0, v1, v2, v3)
+DEFINE_PROGRAM_UNIFORM_FORWARD(4dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(4f, (GLMContext ctx, GLuint program, GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3), location, v0, v1, v2, v3)
+DEFINE_PROGRAM_UNIFORM_FORWARD(4fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(4i, (GLMContext ctx, GLuint program, GLint location, GLint v0, GLint v1, GLint v2, GLint v3), location, v0, v1, v2, v3)
+DEFINE_PROGRAM_UNIFORM_FORWARD(4iv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value), location, count, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(4ui, (GLMContext ctx, GLuint program, GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3), location, v0, v1, v2, v3)
+DEFINE_PROGRAM_UNIFORM_FORWARD(4uiv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value), location, count, value)
 
-void mglProgramUniform1uiv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix2dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix2fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix2x3dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix2x3fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix2x4dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix2x4fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix3dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix3fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix3x2dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix3x2fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix3x4dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix3x4fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix4dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix4fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix4x2dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix4x2fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix4x3dv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value), location, count, transpose, value)
+DEFINE_PROGRAM_UNIFORM_FORWARD(Matrix4x3fv, (GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value), location, count, transpose, value)
 
-void mglProgramUniform2d(GLMContext ctx, GLuint program, GLint location, GLdouble v0, GLdouble v1)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform2dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform2f(GLMContext ctx, GLuint program, GLint location, GLfloat v0, GLfloat v1)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform2fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform2i(GLMContext ctx, GLuint program, GLint location, GLint v0, GLint v1)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform2iv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform2ui(GLMContext ctx, GLuint program, GLint location, GLuint v0, GLuint v1)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform2uiv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform3d(GLMContext ctx, GLuint program, GLint location, GLdouble v0, GLdouble v1, GLdouble v2)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform3dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform3f(GLMContext ctx, GLuint program, GLint location, GLfloat v0, GLfloat v1, GLfloat v2)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform3fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform3i(GLMContext ctx, GLuint program, GLint location, GLint v0, GLint v1, GLint v2)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform3iv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform3ui(GLMContext ctx, GLuint program, GLint location, GLuint v0, GLuint v1, GLuint v2)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform3uiv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform4d(GLMContext ctx, GLuint program, GLint location, GLdouble v0, GLdouble v1, GLdouble v2, GLdouble v3)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform4dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform4f(GLMContext ctx, GLuint program, GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform4fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform4i(GLMContext ctx, GLuint program, GLint location, GLint v0, GLint v1, GLint v2, GLint v3)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform4iv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform4ui(GLMContext ctx, GLuint program, GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniform4uiv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix2dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix2fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix2x3dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix2x3fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix2x4dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix2x4fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix3dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix3fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix3x2dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix3x2fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix3x4dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix3x4fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix4dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix4fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix4x2dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix4x2fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix4x3dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-void mglProgramUniformMatrix4x3fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
-{
-	// TODO: Implement
-	(void)ctx;
-}
+#undef DEFINE_PROGRAM_UNIFORM_FORWARD
 
 void mglProvokingVertex(GLMContext ctx, GLenum mode)
 {
-	// Set provoking vertex mode - no-op
 	if (mode != GL_FIRST_VERTEX_CONVENTION && mode != GL_LAST_VERTEX_CONVENTION) {
 		STATE(error) = GL_INVALID_ENUM;
 		return;
 	}
-	// State not tracked
+	STATE(var.provoking_vertex) = mode;
+	STATE(dirty_bits) |= DIRTY_RENDER_STATE;
 }
 
 void mglPushDebugGroup(GLMContext ctx, GLenum source, GLuint id, GLsizei length, const GLchar *message)
 {
 	// Push debug group - no-op
+	(void)ctx;
 	(void)source;
 	(void)id;
 	(void)length;
@@ -1264,19 +2408,56 @@ void mglPushDebugGroup(GLMContext ctx, GLenum source, GLuint id, GLsizei length,
 
 void mglQueryCounter(GLMContext ctx, GLuint id, GLenum target)
 {
-	// TODO: Implement
-	(void)ctx;
+	QueryObject *q;
+	if (target != GL_TIMESTAMP)
+	{
+		STATE(error) = GL_INVALID_ENUM;
+		return;
+	}
+	if (id == 0)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return;
+	}
+	q = mgl_get_query(id);
+	if (!q)
+	{
+		STATE(error) = GL_OUT_OF_MEMORY;
+		return;
+	}
+	if (q->active)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return;
+	}
+	q->target = GL_TIMESTAMP;
+	q->available = GL_TRUE;
+	q->result = s_fake_timestamp_counter++;
 }
 
 void mglReadnPixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei bufSize, void *data)
 {
-	// TODO: Implement
-	(void)ctx;
+	size_t bytes_per_pixel;
+	size_t needed;
+	if (!data || bufSize < 0)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+	bytes_per_pixel = sizeForFormatType(format, type);
+	needed = (size_t)width * (size_t)height * bytes_per_pixel;
+	if ((GLsizei)needed > bufSize)
+	{
+		STATE(error) = GL_INVALID_OPERATION;
+		return;
+	}
+	mglReadPixels(ctx, x, y, width, height, format, type, data);
 }
 
 void mglReleaseShaderCompiler(GLMContext ctx)
 {
 	// No-op - shader compiler is always available
+	(void)ctx;
 }
 
 void mglResumeTransformFeedback(GLMContext ctx)
@@ -1292,72 +2473,146 @@ void mglResumeTransformFeedback(GLMContext ctx)
 
 void mglSampleMaski(GLMContext ctx, GLuint maskNumber, GLbitfield mask)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglScissorArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+	if (!mgl_validate_viewport_range(ctx, first, count))
+		return;
+	ERROR_CHECK_RETURN(count == 0 || v, GL_INVALID_VALUE);
+	for (GLsizei i = 0; i < count; i++) {
+		ERROR_CHECK_RETURN(v[i * 4 + 2] >= 0, GL_INVALID_VALUE);
+		ERROR_CHECK_RETURN(v[i * 4 + 3] >= 0, GL_INVALID_VALUE);
+	}
+
+	for (GLsizei i = 0; i < count; i++) {
+		GLuint index = first + (GLuint)i;
+		const GLint *box = &v[i * 4];
+		if (index == 0) {
+			mglScissor(ctx, box[0], box[1], (GLsizei)box[2], (GLsizei)box[3]);
+		} else if (index < MGL_MAX_VIEWPORTS) {
+			ctx->state.scissor_box_array[index][0] = box[0];
+			ctx->state.scissor_box_array[index][1] = box[1];
+			ctx->state.scissor_box_array[index][2] = box[2];
+			ctx->state.scissor_box_array[index][3] = box[3];
+			ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+		}
+	}
 }
 
 void mglScissorIndexed(GLMContext ctx, GLuint index, GLint left, GLint bottom, GLsizei width, GLsizei height)
 {
-	// TODO: Implement
-	(void)ctx;
+	ERROR_CHECK_RETURN(index < mgl_effective_max_viewports(ctx), GL_INVALID_VALUE);
+	ERROR_CHECK_RETURN(width >= 0, GL_INVALID_VALUE);
+	ERROR_CHECK_RETURN(height >= 0, GL_INVALID_VALUE);
+	if (index == 0) {
+		mglScissor(ctx, left, bottom, width, height);
+	} else if (index < MGL_MAX_VIEWPORTS) {
+		ctx->state.scissor_box_array[index][0] = left;
+		ctx->state.scissor_box_array[index][1] = bottom;
+		ctx->state.scissor_box_array[index][2] = width;
+		ctx->state.scissor_box_array[index][3] = height;
+		ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+	}
 }
 
 void mglScissorIndexedv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglScissorIndexed(ctx, index, v[0], v[1], (GLsizei)v[2], (GLsizei)v[3]);
 }
 
 void mglSecondaryColorP3ui(GLMContext ctx, GLenum type, GLuint color)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglSecondaryColorP3uiv(GLMContext ctx, GLenum type, const GLuint *color)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglShaderBinary(GLMContext ctx, GLsizei count, const GLuint *shaders, GLenum binaryFormat, const void *binary, GLsizei length)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglShaderStorageBlockBinding(GLMContext ctx, GLuint program, GLuint storageBlockIndex, GLuint storageBlockBinding)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglSpecializeShader(GLMContext ctx, GLuint shader, const GLchar *pEntryPoint, GLuint numSpecializationConstants, const GLuint *pConstantIndex, const GLuint *pConstantValue)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglTexBuffer(GLMContext ctx, GLenum target, GLenum internalformat, GLuint buffer)
 {
-	// TODO: Implement
-	(void)ctx;
+    Texture *tex;
+    GLuint active_unit = ctx ? ctx->state.active_texture : 0u;
+
+    ERROR_CHECK_RETURN(target == GL_TEXTURE_BUFFER, GL_INVALID_ENUM);
+
+    tex = (ctx && active_unit < TEXTURE_UNITS)
+        ? ctx->state.texture_units[active_unit].textures[_TEXTURE_BUFFER_TARGET]
+        : NULL;
+
+    if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+        fprintf(stderr,
+                "MGL TRACE mglTexBuffer target=0x%x internal=0x%x buffer=%u activeUnit=%u boundTex=%u tex=%p\n",
+                target,
+                internalformat,
+                buffer,
+                active_unit,
+                tex ? tex->name : 0u,
+                (void *)tex);
+    }
+
+    ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
+
+    mglTextureBufferRange(ctx, tex->name, internalformat, buffer, 0, 0);
 }
 
 void mglTexBufferRange(GLMContext ctx, GLenum target, GLenum internalformat, GLuint buffer, GLintptr offset, GLsizeiptr size)
 {
-	// TODO: Implement
-	(void)ctx;
+    Texture *tex;
+    GLuint active_unit = ctx ? ctx->state.active_texture : 0u;
+
+    ERROR_CHECK_RETURN(target == GL_TEXTURE_BUFFER, GL_INVALID_ENUM);
+
+    tex = (ctx && active_unit < TEXTURE_UNITS)
+        ? ctx->state.texture_units[active_unit].textures[_TEXTURE_BUFFER_TARGET]
+        : NULL;
+
+    if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+        fprintf(stderr,
+                "MGL TRACE mglTexBufferRange target=0x%x internal=0x%x buffer=%u offset=%lld size=%lld activeUnit=%u boundTex=%u tex=%p\n",
+                target,
+                internalformat,
+                buffer,
+                (long long)offset,
+                (long long)size,
+                active_unit,
+                tex ? tex->name : 0u,
+                (void *)tex);
+    }
+
+    ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
+
+    mglTextureBufferRange(ctx, tex->name, internalformat, buffer, offset, size);
 }
 
 void mglTexStorage2DMultisample(GLMContext ctx, GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations)
 {
+	mgl_unimplemented(ctx, __FUNCTION__);
     // For multisample textures, we need to create storage but Apple Silicon 
     // handles MSAA differently than traditional GL. For now, we create a 
     // regular texture and let the rendering pipeline handle any MSAA.
@@ -1368,7 +2623,7 @@ void mglTexStorage2DMultisample(GLMContext ctx, GLenum target, GLsizei samples, 
     // Validate target
     if (target != GL_TEXTURE_2D_MULTISAMPLE && target != GL_PROXY_TEXTURE_2D_MULTISAMPLE) {
         fprintf(stderr, "MGL WARNING: mglTexStorage2DMultisample invalid target 0x%x\n", target);
-        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_ENUM);
+        mglDispatchError(ctx, __FUNCTION__, GL_INVALID_ENUM);
         return;
     }
     
@@ -1383,537 +2638,493 @@ void mglTexStorage2DMultisample(GLMContext ctx, GLenum target, GLsizei samples, 
 
 void mglTexStorage3DMultisample(GLMContext ctx, GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglTransformFeedbackBufferBase(GLMContext ctx, GLuint xfb, GLuint index, GLuint buffer)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglTransformFeedbackBufferRange(GLMContext ctx, GLuint xfb, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglTransformFeedbackVaryings(GLMContext ctx, GLuint program, GLsizei count, const GLchar *const*varyings, GLenum bufferMode)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglUniformSubroutinesuiv(GLMContext ctx, GLenum shadertype, GLsizei count, const GLuint *indices)
 {
-	// TODO: Implement
+	mgl_unimplemented(ctx, __FUNCTION__);
 	(void)ctx;
 }
 
 void mglValidateProgram(GLMContext ctx, GLuint program)
 {
 	// Program validation - no-op for now, programs are validated during linking
-	(void)program;
+	Program *pptr = findProgram(ctx, program);
+	if (!pptr)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
 }
 
 void mglValidateProgramPipeline(GLMContext ctx, GLuint pipeline)
 {
-	// TODO: Implement
-	(void)ctx;
+	ProgramPipeline *pp = findProgramPipeline(ctx, pipeline);
+	if (!pp)
+	{
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+	pp->validated = GL_TRUE;
 }
 
 void mglVertexAttrib1d(GLMContext ctx, GLuint index, GLdouble x)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib1dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib1f(GLMContext ctx, GLuint index, GLfloat x)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib1fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib1s(GLMContext ctx, GLuint index, GLshort x)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib1sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib2d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib2dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib2f(GLMContext ctx, GLuint index, GLfloat x, GLfloat y)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib2fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib2s(GLMContext ctx, GLuint index, GLshort x, GLshort y)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib2sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib3d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y, GLdouble z)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib3dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib3f(GLMContext ctx, GLuint index, GLfloat x, GLfloat y, GLfloat z)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib3fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib3s(GLMContext ctx, GLuint index, GLshort x, GLshort y, GLshort z)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib3sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4Nbv(GLMContext ctx, GLuint index, const GLbyte *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4Niv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4Nsv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4Nub(GLMContext ctx, GLuint index, GLubyte x, GLubyte y, GLubyte z, GLubyte w)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4Nubv(GLMContext ctx, GLuint index, const GLubyte *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4Nuiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4Nusv(GLMContext ctx, GLuint index, const GLushort *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4bv(GLMContext ctx, GLuint index, const GLbyte *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y, GLdouble z, GLdouble w)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4f(GLMContext ctx, GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4iv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4s(GLMContext ctx, GLuint index, GLshort x, GLshort y, GLshort z, GLshort w)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4ubv(GLMContext ctx, GLuint index, const GLubyte *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4uiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttrib4usv(GLMContext ctx, GLuint index, const GLushort *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI1i(GLMContext ctx, GLuint index, GLint x)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI1iv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI1ui(GLMContext ctx, GLuint index, GLuint x)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI1uiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI2i(GLMContext ctx, GLuint index, GLint x, GLint y)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI2iv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI2ui(GLMContext ctx, GLuint index, GLuint x, GLuint y)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI2uiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI3i(GLMContext ctx, GLuint index, GLint x, GLint y, GLint z)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI3iv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI3ui(GLMContext ctx, GLuint index, GLuint x, GLuint y, GLuint z)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI3uiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI4bv(GLMContext ctx, GLuint index, const GLbyte *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI4i(GLMContext ctx, GLuint index, GLint x, GLint y, GLint z, GLint w)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI4iv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI4sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI4ubv(GLMContext ctx, GLuint index, const GLubyte *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI4ui(GLMContext ctx, GLuint index, GLuint x, GLuint y, GLuint z, GLuint w)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI4uiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribI4usv(GLMContext ctx, GLuint index, const GLushort *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribL1d(GLMContext ctx, GLuint index, GLdouble x)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribL1dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribL2d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribL2dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribL3d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y, GLdouble z)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribL3dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribL4d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y, GLdouble z, GLdouble w)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribL4dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribP1ui(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, GLuint value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribP1uiv(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, const GLuint *value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribP2ui(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, GLuint value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribP2uiv(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, const GLuint *value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribP3ui(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, GLuint value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribP3uiv(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, const GLuint *value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribP4ui(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, GLuint value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexAttribP4uiv(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, const GLuint *value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexP2ui(GLMContext ctx, GLenum type, GLuint value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexP2uiv(GLMContext ctx, GLenum type, const GLuint *value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexP3ui(GLMContext ctx, GLenum type, GLuint value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexP3uiv(GLMContext ctx, GLenum type, const GLuint *value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexP4ui(GLMContext ctx, GLenum type, GLuint value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglVertexP4uiv(GLMContext ctx, GLenum type, const GLuint *value)
 {
-	// TODO: Implement
 	(void)ctx;
 }
 
 void mglViewportArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLfloat *v)
 {
-	// TODO: Implement
-	(void)ctx;
+	if (!mgl_validate_viewport_range(ctx, first, count))
+		return;
+	ERROR_CHECK_RETURN(count == 0 || v, GL_INVALID_VALUE);
+	for (GLsizei i = 0; i < count; i++) {
+		ERROR_CHECK_RETURN(v[i * 4 + 2] >= 0.0f, GL_INVALID_VALUE);
+		ERROR_CHECK_RETURN(v[i * 4 + 3] >= 0.0f, GL_INVALID_VALUE);
+	}
+
+	for (GLsizei i = 0; i < count; i++) {
+		mglViewportIndexedf(ctx,
+		                    first + (GLuint)i,
+		                    v[i * 4 + 0],
+		                    v[i * 4 + 1],
+		                    v[i * 4 + 2],
+		                    v[i * 4 + 3]);
+	}
 }
 
 void mglViewportIndexedf(GLMContext ctx, GLuint index, GLfloat x, GLfloat y, GLfloat w, GLfloat h)
 {
-	// TODO: Implement
-	(void)ctx;
+	ERROR_CHECK_RETURN(index < mgl_effective_max_viewports(ctx), GL_INVALID_VALUE);
+	ERROR_CHECK_RETURN(w >= 0.0f, GL_INVALID_VALUE);
+	ERROR_CHECK_RETURN(h >= 0.0f, GL_INVALID_VALUE);
+	if (index == 0) {
+		mglViewport(ctx, (GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h);
+	} else if (index < MGL_MAX_VIEWPORTS) {
+		ctx->state.viewport_array[index][0] = x;
+		ctx->state.viewport_array[index][1] = y;
+		ctx->state.viewport_array[index][2] = w;
+		ctx->state.viewport_array[index][3] = h;
+		ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+	}
 }
 
 void mglViewportIndexedfv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	// TODO: Implement
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglViewportIndexedf(ctx, index, v[0], v[1], v[2], v[3]);
 }
 
 #ifdef MGL_GL_ES
 void  mglBlendBarrier(GLMContext ctx)
 {
     // Unimplemented function
-    assert(0);
+    mgl_unimplemented(ctx, __FUNCTION__);
 
 }
 

@@ -1,11 +1,11 @@
 SHELL := /bin/bash
 $(VERBOSE).SILENT:
 
-SDKPATH := $(shell xcrun --sdk iphoneos --show-sdk-path)
+SDKPATH := $(THEOS_SDK_PATH)
 
 WORKINGDIR       := "build"
 CMAKE_BUILD_TYPE := "release"
-JOBS             := $(sysctl -n hw.ncpu)
+JOBS             := 10
 	
 build_external:
 	cd external; \
@@ -22,8 +22,8 @@ build: build_external
 		-DCMAKE_OSX_SYSROOT=$(SDKPATH) \
 		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
 		-DCMAKE_OSX_ARCHITECTURES=arm64 \
-		-DCMAKE_C_FLAGS="-arch arm64 -isysroot $(SDKPATH) -miphoneos-version-min=14.0 -DTARGET_OS_IPHONE=1" \
-		-DCMAKE_CXX_FLAGS="-arch arm64 -isysroot $(SDKPATH) -miphoneos-version-min=14.0 -DTARGET_OS_IPHONE=1 -std=c++14" \
+		-DCMAKE_C_FLAGS="-arch arm64 -isysroot $(SDKPATH) -target arm64-apple-ios14.0 -DTARGET_OS_IPHONE=1" \
+		-DCMAKE_CXX_FLAGS="-arch arm64 -isysroot $(SDKPATH) -target arm64-apple-ios14.0 -DTARGET_OS_IPHONE=1b -stdlib=libc++" \
 		-DCMAKE_EXE_LINKER_FLAGS="-isysroot $(SDKPATH) -Wl,-syslibroot,$(SDKPATH)" \
 		-DCMAKE_SHARED_LINKER_FLAGS="-isysroot $(SDKPATH) -Wl,-syslibroot,$(SDKPATH)" \
 		..

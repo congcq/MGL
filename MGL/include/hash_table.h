@@ -22,6 +22,7 @@
 #define hash_table_h
 
 #include "glcorearb.h"
+#include <stdint.h>
 
 typedef struct {
     GLuint name;
@@ -30,15 +31,25 @@ typedef struct {
 
 typedef struct {
     size_t size;
+    size_t count;
     GLuint current_name;
     HashObj *keys;
+    unsigned char *states;
+    uintptr_t keys_cookie;
+    uintptr_t states_cookie;
 } HashTable;
 
 HashTable *createHashTable(GLuint size);
 void initHashTable(HashTable *ptr, GLuint size);
+void destroyHashTable(HashTable *ptr);
 GLuint getNewName(HashTable *table);
 void insertHashElement(HashTable *table, GLuint name, void *data);
 void *searchHashTable(HashTable *table, GLuint name);
 void deleteHashElement(HashTable *table, GLuint name);
+typedef void (*MGLHashTableForEachFunc)(GLuint name, void *data, void *user);
+void mglHashTableForEach(HashTable *table, MGLHashTableForEachFunc func, void *user);
+void mglHashTableClearEntries(HashTable *table);
+int mglHashTableValidateStorage(HashTable *table, const char *where);
+int mglHashTableContainsData(HashTable *table, const void *data);
 
 #endif /* hash_table_h */

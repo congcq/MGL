@@ -3,8 +3,8 @@ project(MGL)
 
 set(CMAKE_OSX_DEPLOYMENT_TARGET 14.0)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -target arm64-apple-ios -fcommon -fobjc-arc -ObjC")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -target arm64-apple-ios -fcommon -fobjc-arc -ObjC -std=c++14")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -target arm64-apple-ios14.0 -fcommon -fobjc-arc -ObjC")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -target arm64-apple-ios14.0 -fcommon -fobjc-arc -ObjC -stdlib=libc++")
 set(CMAKE_C_FLAGS_DEBUG "-funwind-tables -g")
 
 if("${CMAKE_HOST_SYSTEM_NAME}" MATCHES "Linux|^GNU$|Android")

@@ -22,6 +22,7 @@
 #include "glcorearb.h"
 
 #include "glm_context.h"
+#include "mgl_extensions.h"
 
 #include <unistd.h>
 #include <dlfcn.h>
@@ -45,7 +46,7 @@ void getMacOSDefaults(GLMContext glm_ctx)
     CGLError (*CGLDestroyPixelFormat)(CGLPixelFormatObj pix);
     CGLError (*CGLCreateContext)(CGLPixelFormatObj pix, CGLContextObj OPENGL_NULLABLE share, CGLContextObj OPENGL_NULLABLE * OPENGL_NONNULL ctx);
     CGLError (*CGLDestroyContext)(CGLContextObj ctx);
-    void (*glGetIntegerv)(GLenum param, GLuint *params);
+    void (*glGetIntegerv)(GLenum param, GLint *params);
     void (*glGetDoublev)(GLenum param, GLdouble *params);
     void (*glGetFloatv)(GLenum param, GLfloat *params);
     void (*glGetBooleanv)(GLenum param, GLboolean *params);
@@ -59,27 +60,61 @@ void getMacOSDefaults(GLMContext glm_ctx)
       (CGLPixelFormatAttribute) 0
     };
 
-    OpenGL = dlopen(OpenGLPath, RTLD_LAZY | RTLD_LOCAL); assert(OpenGL);
-    libGL = dlopen(libGLPath, RTLD_LAZY | RTLD_LOCAL); assert(libGL);
+    OpenGL = dlopen(OpenGLPath, RTLD_LAZY | RTLD_LOCAL);
+    libGL = dlopen(libGLPath, RTLD_LAZY | RTLD_LOCAL);
+    if (!OpenGL || !libGL)
+    {
+        fprintf(stderr,
+                "MGL WARN: failed to load system OpenGL defaults provider OpenGL=%p libGL=%p, using fallback defaults\n",
+                OpenGL,
+                libGL);
+        if (OpenGL) dlclose(OpenGL);
+        if (libGL) dlclose(libGL);
+        return;
+    }
 
-    CGLChoosePixelFormat = dlsym(OpenGL, "CGLChoosePixelFormat"); assert(CGLChoosePixelFormat);
-    CGLDestroyPixelFormat = dlsym(OpenGL, "CGLDestroyPixelFormat"); assert(CGLDestroyPixelFormat);
-    CGLCreateContext = dlsym(OpenGL, "CGLCreateContext"); assert(CGLCreateContext);
-    CGLDestroyContext = dlsym(OpenGL, "CGLDestroyContext"); assert(CGLDestroyContext);
-    glGetIntegerv = dlsym(libGL, "glGetIntegerv"); assert(glGetIntegerv);
-    glGetDoublev = dlsym(libGL, "glGetDoublev"); assert(glGetDoublev);
-    glGetFloatv = dlsym(libGL, "glGetFloatv"); assert(glGetFloatv);
-    glGetBooleanv = dlsym(libGL, "glGetBooleanv"); assert(glGetBooleanv);
+    CGLChoosePixelFormat = dlsym(OpenGL, "CGLChoosePixelFormat");
+    CGLDestroyPixelFormat = dlsym(OpenGL, "CGLDestroyPixelFormat");
+    CGLCreateContext = dlsym(OpenGL, "CGLCreateContext");
+    CGLDestroyContext = dlsym(OpenGL, "CGLDestroyContext");
+    glGetIntegerv = dlsym(libGL, "glGetIntegerv");
+    glGetDoublev = dlsym(libGL, "glGetDoublev");
+    glGetFloatv = dlsym(libGL, "glGetFloatv");
+    glGetBooleanv = dlsym(libGL, "glGetBooleanv");
+    if (!CGLChoosePixelFormat || !CGLDestroyPixelFormat || !CGLCreateContext || !CGLDestroyContext ||
+        !glGetIntegerv || !glGetDoublev || !glGetFloatv || !glGetBooleanv)
+    {
+        fprintf(stderr, "MGL WARN: missing system OpenGL symbols, using fallback defaults\n");
+        dlclose(OpenGL);
+        dlclose(libGL);
+        return;
+    }
 
     CGLPixelFormatObj pix;
     CGLError errorCode;
     GLint num; // stores the number of possible pixel formats
-    errorCode = CGLChoosePixelFormat( attributes, &pix, &num ); assert(errorCode == kCGLNoError);
-    // add error checking here
-    errorCode = CGLCreateContext( pix, NULL, &ctx ); assert(errorCode == kCGLNoError);
+    errorCode = CGLChoosePixelFormat(attributes, &pix, &num);
+    if (errorCode != kCGLNoError || !pix || num <= 0)
+    {
+        fprintf(stderr, "MGL WARN: CGLChoosePixelFormat failed (%d), using fallback defaults\n", (int)errorCode);
+        return;
+    }
+    errorCode = CGLCreateContext(pix, NULL, &ctx);
+    if (errorCode != kCGLNoError || !ctx)
+    {
+        fprintf(stderr, "MGL WARN: CGLCreateContext failed (%d), using fallback defaults\n", (int)errorCode);
+        CGLDestroyPixelFormat(pix);
+        return;
+    }
     CGLDestroyPixelFormat( pix );
 
-    errorCode = CGLSetCurrentContext( ctx ); assert(errorCode == kCGLNoError);
+    errorCode = CGLSetCurrentContext(ctx);
+    if (errorCode != kCGLNoError)
+    {
+        fprintf(stderr, "MGL WARN: CGLSetCurrentContext failed (%d), using fallback defaults\n", (int)errorCode);
+        CGLDestroyContext(ctx);
+        return;
+    }
 
     glGetFloatv(GL_POINT_SIZE,&glm_ctx->state.var.point_size);
     glGetIntegerv(GL_POINT_SIZE_RANGE,&glm_ctx->state.var.point_size_range);
@@ -120,10 +155,20 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetBooleanv(GL_COLOR_WRITEMASK,glm_ctx->state.var.color_writemask[0]);
 
     glGetIntegerv(GL_MAX_TEXTURE_SIZE,&glm_ctx->state.var.max_texture_size);
+    if (glm_ctx->state.var.max_texture_size == 0x01010101 ||
+        glm_ctx->state.var.max_texture_size <= 1024 ||
+        glm_ctx->state.var.max_texture_size > 32768)
+    {
+        glm_ctx->state.var.max_texture_size = 16384;
+    }
+    else if (glm_ctx->state.var.max_texture_size > 16384)
+    {
+        glm_ctx->state.var.max_texture_size = 16384;
+    }
     glGetIntegerv(GL_MAX_VIEWPORT_DIMS,&glm_ctx->state.var.max_viewport_dims);
     glGetIntegerv(GL_SUBPIXEL_BITS,&glm_ctx->state.var.subpixel_bits);
-    glGetIntegerv(GL_POLYGON_OFFSET_UNITS,&glm_ctx->state.var.polygon_offset_units);
-    glGetIntegerv(GL_POLYGON_OFFSET_FACTOR,&glm_ctx->state.var.polygon_offset_factor);
+    glGetFloatv(GL_POLYGON_OFFSET_UNITS,&glm_ctx->state.var.polygon_offset_units);
+    glGetFloatv(GL_POLYGON_OFFSET_FACTOR,&glm_ctx->state.var.polygon_offset_factor);
     glGetIntegerv(GL_TEXTURE_BINDING_1D,&glm_ctx->state.var.texture_binding_1d);
     glGetIntegerv(GL_TEXTURE_BINDING_2D,&glm_ctx->state.var.texture_binding_2d);
     glGetIntegerv(GL_TEXTURE_BINDING_3D,&glm_ctx->state.var.texture_binding_3d);
@@ -135,7 +180,7 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_SMOOTH_LINE_WIDTH_RANGE,&glm_ctx->state.var.smooth_line_width_range);
     glGetIntegerv(GL_SMOOTH_LINE_WIDTH_GRANULARITY,&glm_ctx->state.var.smooth_line_width_granularity);
     glGetIntegerv(GL_ALIASED_LINE_WIDTH_RANGE,&glm_ctx->state.var.aliased_line_width_range);
-    glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE,&glm_ctx->state.var.sample_coverage_value);
+    glGetFloatv(GL_SAMPLE_COVERAGE_VALUE,&glm_ctx->state.var.sample_coverage_value);
     glGetIntegerv(GL_SAMPLE_COVERAGE_INVERT,&glm_ctx->state.var.sample_coverage_invert);
     glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP,&glm_ctx->state.var.texture_binding_cube_map);
     glGetIntegerv(GL_MAX_CUBE_MAP_TEXTURE_SIZE,&glm_ctx->state.var.max_cube_map_texture_size);
@@ -160,15 +205,48 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_STENCIL_BACK_FAIL,&glm_ctx->state.var.stencil_back_fail);
     glGetIntegerv(GL_STENCIL_BACK_PASS_DEPTH_FAIL,&glm_ctx->state.var.stencil_back_pass_depth_fail);
     glGetIntegerv(GL_STENCIL_BACK_PASS_DEPTH_PASS,&glm_ctx->state.var.stencil_back_pass_depth_pass);
-    glGetIntegerv(GL_MAX_DRAW_BUFFERS,&glm_ctx->state.var.max_draw_buffers);
+    glm_ctx->state.var.max_draw_buffers = 8; // OpenGL minimum; MGL supports up to MAX_COLOR_ATTACHMENTS
     glGetIntegerv(GL_BLEND_EQUATION_ALPHA,&glm_ctx->state.var.blend_equation_alpha[0]);
-    glGetIntegerv(GL_MAX_VERTEX_ATTRIBS,&glm_ctx->state.max_vertex_attribs);
-    glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS,&glm_ctx->state.var.max_texture_image_units);
-    glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_COMPONENTS,&glm_ctx->state.var.max_fragment_uniform_components);
-    glGetIntegerv(GL_MAX_VERTEX_UNIFORM_COMPONENTS,&glm_ctx->state.var.max_vertex_uniform_components);
-    glGetIntegerv(GL_MAX_VARYING_FLOATS,&glm_ctx->state.var.max_varying_floats);
-    glGetIntegerv(GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS,&glm_ctx->state.var.max_vertex_texture_image_units);
-    glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS,&glm_ctx->state.var.max_combined_texture_image_units);
+    if (glm_ctx->state.var.blend_src_rgb[0] == GL_ZERO &&
+        glm_ctx->state.var.blend_src_alpha[0] == GL_ZERO) {
+        fprintf(stderr,
+                "MGL WARNING: init repaired default blend src factors GL_ZERO -> GL_ONE\n");
+        glm_ctx->state.var.blend_src_rgb[0] = GL_ONE;
+        glm_ctx->state.var.blend_src_alpha[0] = GL_ONE;
+    }
+    if (glm_ctx->state.var.blend_dst_rgb[0] == 0 &&
+        glm_ctx->state.var.blend_dst_alpha[0] == 0) {
+        glm_ctx->state.var.blend_dst_rgb[0] = GL_ZERO;
+        glm_ctx->state.var.blend_dst_alpha[0] = GL_ZERO;
+    }
+    if (glm_ctx->state.var.blend_equation_rgb[0] == 0) {
+        fprintf(stderr,
+                "MGL WARNING: init repaired default blend equation rgb 0 -> GL_FUNC_ADD\n");
+        glm_ctx->state.var.blend_equation_rgb[0] = GL_FUNC_ADD;
+    }
+    if (glm_ctx->state.var.blend_equation_alpha[0] == 0) {
+        fprintf(stderr,
+                "MGL WARNING: init repaired default blend equation alpha 0 -> GL_FUNC_ADD\n");
+        glm_ctx->state.var.blend_equation_alpha[0] = GL_FUNC_ADD;
+    }
+    if (!glm_ctx->state.var.color_writemask[0][0] &&
+        !glm_ctx->state.var.color_writemask[0][1] &&
+        !glm_ctx->state.var.color_writemask[0][2] &&
+        !glm_ctx->state.var.color_writemask[0][3]) {
+        fprintf(stderr,
+                "MGL WARNING: init repaired default color writemask 0000 -> 1111\n");
+        glm_ctx->state.var.color_writemask[0][0] = GL_TRUE;
+        glm_ctx->state.var.color_writemask[0][1] = GL_TRUE;
+        glm_ctx->state.var.color_writemask[0][2] = GL_TRUE;
+        glm_ctx->state.var.color_writemask[0][3] = GL_TRUE;
+    }
+    glm_ctx->state.max_vertex_attribs = 32; // OpenGL minimum is 16; MGL supports up to MAX_ATTRIBS
+    glm_ctx->state.var.max_texture_image_units = 32; // OpenGL minimum 16; Metal supports more
+    glm_ctx->state.var.max_fragment_uniform_components = 4096;
+    glm_ctx->state.var.max_vertex_uniform_components = 4096;
+    glm_ctx->state.var.max_varying_floats = 64;
+    glm_ctx->state.var.max_vertex_texture_image_units = 32;
+    glm_ctx->state.var.max_combined_texture_image_units = 192;
     glGetIntegerv(GL_CURRENT_PROGRAM,&glm_ctx->state.var.current_program);
     glGetIntegerv(GL_STENCIL_BACK_REF,&glm_ctx->state.var.stencil_back_ref);
     glGetIntegerv(GL_STENCIL_BACK_VALUE_MASK,&glm_ctx->state.var.stencil_back_value_mask);
@@ -183,8 +261,7 @@ void getMacOSDefaults(GLMContext glm_ctx)
     //glGetIntegerv(GL_MINOR_VERSION,&glm_ctx->state.var.minor_version);
     glm_ctx->state.var.minor_version = 6;
 
-    //glGetIntegerv(GL_NUM_EXTENSIONS,&glm_ctx->state.var.num_extensions);
-    glm_ctx->state.var.num_extensions = 0;
+    glm_ctx->state.var.num_extensions = MGL_NUM_EXTENSIONS;
 
     glGetIntegerv(GL_CONTEXT_FLAGS,&glm_ctx->state.var.context_flags);
     glGetIntegerv(GL_MAX_ARRAY_TEXTURE_LAYERS,&glm_ctx->state.var.max_array_texture_layers);
@@ -199,6 +276,14 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&glm_ctx->state.var.read_framebuffer_binding);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING,&glm_ctx->state.var.vertex_array_binding);
     glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE,&glm_ctx->state.var.max_texture_buffer_size);
+    if (glm_ctx->state.var.max_texture_buffer_size == 0 ||
+        glm_ctx->state.var.max_texture_buffer_size == 0x01010101 ||
+        glm_ctx->state.var.max_texture_buffer_size > (1u << 28)) {
+        fprintf(stderr,
+                "MGL WARNING: init repaired GL_MAX_TEXTURE_BUFFER_SIZE=%u -> 1048576\n",
+                glm_ctx->state.var.max_texture_buffer_size);
+        glm_ctx->state.var.max_texture_buffer_size = 1u << 20;
+    }
     glGetIntegerv(GL_TEXTURE_BINDING_BUFFER,&glm_ctx->state.var.texture_binding_buffer);
     glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE,&glm_ctx->state.var.texture_binding_rectangle);
     glGetIntegerv(GL_MAX_RECTANGLE_TEXTURE_SIZE,&glm_ctx->state.var.max_rectangle_texture_size);
@@ -246,6 +331,9 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_PROGRAM_BINARY_FORMATS,&glm_ctx->state.var.program_binary_formats);
     glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING,&glm_ctx->state.var.program_pipeline_binding);
     glGetIntegerv(GL_MAX_VIEWPORTS,&glm_ctx->state.var.max_viewports);
+    if (glm_ctx->state.var.max_viewports == 0 || glm_ctx->state.var.max_viewports > MGL_MAX_VIEWPORTS) {
+        glm_ctx->state.var.max_viewports = MGL_MAX_VIEWPORTS;
+    }
     glGetIntegerv(GL_VIEWPORT_SUBPIXEL_BITS,&glm_ctx->state.var.viewport_subpixel_bits);
     glGetIntegerv(GL_VIEWPORT_BOUNDS_RANGE,&glm_ctx->state.var.viewport_bounds_range);
     glGetIntegerv(GL_LAYER_PROVOKING_VERTEX,&glm_ctx->state.var.layer_provoking_vertex);
@@ -273,6 +361,17 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_MAX_DEBUG_GROUP_STACK_DEPTH,&glm_ctx->state.var.max_debug_group_stack_depth);
     glGetIntegerv(GL_DEBUG_GROUP_STACK_DEPTH,&glm_ctx->state.var.debug_group_stack_depth);
     glGetIntegerv(GL_MAX_LABEL_LENGTH,&glm_ctx->state.var.max_label_length);
+    if (glm_ctx->state.var.max_debug_group_stack_depth == 0 ||
+        glm_ctx->state.var.max_debug_group_stack_depth > 1024) {
+        glm_ctx->state.var.max_debug_group_stack_depth = 64;
+    }
+    if (glm_ctx->state.var.debug_group_stack_depth > glm_ctx->state.var.max_debug_group_stack_depth) {
+        glm_ctx->state.var.debug_group_stack_depth = 0;
+    }
+    if (glm_ctx->state.var.max_label_length < 64 ||
+        glm_ctx->state.var.max_label_length > 4096) {
+        glm_ctx->state.var.max_label_length = 128;
+    }
     glGetIntegerv(GL_MAX_UNIFORM_LOCATIONS,&glm_ctx->state.var.max_uniform_locations);
     glGetIntegerv(GL_MAX_FRAMEBUFFER_WIDTH,&glm_ctx->state.var.max_framebuffer_width);
     glGetIntegerv(GL_MAX_FRAMEBUFFER_HEIGHT,&glm_ctx->state.var.max_framebuffer_height);
@@ -292,11 +391,28 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS,&glm_ctx->state.var.max_shader_storage_buffer_bindings);
     glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT,&glm_ctx->state.var.shader_storage_buffer_offset_alignment);
     glGetIntegerv(GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT,&glm_ctx->state.var.texture_buffer_offset_alignment);
+    if (glm_ctx->state.var.texture_buffer_offset_alignment == 0 ||
+        glm_ctx->state.var.texture_buffer_offset_alignment == 0x01010101 ||
+        glm_ctx->state.var.texture_buffer_offset_alignment > 4096) {
+        fprintf(stderr,
+                "MGL WARNING: init repaired GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT=%u -> 16\n",
+                glm_ctx->state.var.texture_buffer_offset_alignment);
+        glm_ctx->state.var.texture_buffer_offset_alignment = 16;
+    }
     glGetIntegerv(GL_VERTEX_BINDING_DIVISOR,&glm_ctx->state.var.vertex_binding_divisor);
     glGetIntegerv(GL_VERTEX_BINDING_OFFSET,&glm_ctx->state.var.vertex_binding_offset);
     glGetIntegerv(GL_VERTEX_BINDING_STRIDE,&glm_ctx->state.var.vertex_binding_stride);
     glGetIntegerv(GL_MAX_VERTEX_ATTRIB_RELATIVE_OFFSET,&glm_ctx->state.var.max_vertex_attrib_relative_offset);
     glGetIntegerv(GL_MAX_VERTEX_ATTRIB_BINDINGS,&glm_ctx->state.var.max_vertex_attrib_bindings);
+    if (glm_ctx->state.var.max_vertex_attrib_bindings < MAX_ATTRIBS ||
+        glm_ctx->state.var.max_vertex_attrib_bindings == 0x01010101u ||
+        glm_ctx->state.var.max_vertex_attrib_bindings > MGL_MAX_VERTEX_ATTRIB_BINDINGS) {
+        glm_ctx->state.var.max_vertex_attrib_bindings = MGL_MAX_VERTEX_ATTRIB_BINDINGS;
+    }
+    if (glm_ctx->state.var.max_vertex_attrib_relative_offset < 2047u ||
+        glm_ctx->state.var.max_vertex_attrib_relative_offset == 0x01010101u) {
+        glm_ctx->state.var.max_vertex_attrib_relative_offset = 2047u;
+    }
     glGetIntegerv(GL_TEXTURE_BINDING_1D,&glm_ctx->state.var.texture_binding_1d);
     glGetIntegerv(GL_TEXTURE_BINDING_1D_ARRAY,&glm_ctx->state.var.texture_binding_1d_array);
     glGetIntegerv(GL_TEXTURE_BINDING_2D,&glm_ctx->state.var.texture_binding_2d);

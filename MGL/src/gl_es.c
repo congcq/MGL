@@ -12,10 +12,13 @@
 
 #include "glm_context.h"
 
-extern GLMContext _ctx;
 extern void mgl_lazy_init(void);
 
-#define GET_CONTEXT()   (mgl_lazy_init(), _ctx)
+#define GET_CONTEXT()   (mgl_lazy_init(), MGLgetCurrentContext())
+
+#ifndef MGL_VERBOSE_TEXBUFFER_LOGS
+#define MGL_VERBOSE_TEXBUFFER_LOGS 0
+#endif
 
 void glReadBuffer(GLenum src)
 {
@@ -1512,12 +1515,32 @@ void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer)
 {
 	GLMContext ctx = GET_CONTEXT();
 
+	if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+		fprintf(stderr,
+		        "MGL TRACE glTexBuffer.entry target=0x%x internal=0x%x buffer=%u ctx=%p\n",
+		        target,
+		        internalformat,
+		        buffer,
+		        (void *)ctx);
+	}
+
 	ctx->dispatch.tex_buffer(ctx, target, internalformat, buffer);
 }
 
 void glTexBufferRange(GLenum target, GLenum internalformat, GLuint buffer, GLintptr offset, GLsizeiptr size)
 {
 	GLMContext ctx = GET_CONTEXT();
+
+	if (MGL_VERBOSE_TEXBUFFER_LOGS) {
+		fprintf(stderr,
+		        "MGL TRACE glTexBufferRange.entry target=0x%x internal=0x%x buffer=%u offset=%lld size=%lld ctx=%p\n",
+		        target,
+		        internalformat,
+		        buffer,
+		        (long long)offset,
+		        (long long)size,
+		        (void *)ctx);
+	}
 
 	ctx->dispatch.tex_buffer_range(ctx, target, internalformat, buffer, offset, size);
 }
@@ -1528,4 +1551,3 @@ void glTexStorage3DMultisample(GLenum target, GLsizei samples, GLenum internalfo
 
 	ctx->dispatch.tex_storage3_d_multisample(ctx, target, samples, internalformat, width, height, depth, fixedsamplelocations);
 }
-

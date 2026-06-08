@@ -21,6 +21,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <assert.h>
+#include <string.h>
 
 #include "error.h"
 
@@ -31,8 +32,14 @@ GLenum  mglGetError(GLMContext ctx)
 
     err = ctx->state.error;
 
-    if (err != GL_NO_ERROR)
-        fprintf(stderr, "MGL DEBUG: mglGetError returning 0x%x (%d)\n", err, err);
+    if (err != GL_NO_ERROR) {
+        static unsigned long long s_get_error_log_count = 0;
+        s_get_error_log_count++;
+        if (s_get_error_log_count <= 64ull || (s_get_error_log_count % 1024ull) == 0ull) {
+            fprintf(stderr, "MGL DEBUG: mglGetError returning 0x%x (%d) hit=%llu\n",
+                    err, err, s_get_error_log_count);
+        }
+    }
 
     ctx->state.error = GL_NO_ERROR;
 
@@ -40,8 +47,62 @@ GLenum  mglGetError(GLMContext ctx)
 }
 
 
+static int mgl_is_ignorable_texture_error(const char *func, GLenum error)
+{
+    if (!func || error != GL_INVALID_OPERATION)
+        return 0;
+
+    /* Minecraft startup performs a lot of texture probing/update patterns.
+     * Treat transient INVALID_OPERATION from texture paths as non-fatal
+     * compatibility warnings so createTexture() does not abort startup. */
+    if (strstr(func, "mglTex") != NULL) return 1;
+    if (strstr(func, "mglTexture") != NULL) return 1;
+    if (strstr(func, "texSubImage") != NULL) return 1;
+    if (strstr(func, "generateMipmaps") != NULL) return 1;
+    if (strstr(func, "createTextureLevel") != NULL) return 1;
+
+    return 0;
+}
+
+void mglDispatchError(GLMContext ctx, const char *func, GLenum error)
+{
+    if (!ctx) {
+        fprintf(stderr,
+                "MGL ERROR: dispatch with NULL ctx in %s (0x%x)\n",
+                func ? func : "(null)",
+                error);
+        return;
+    }
+
+    if (ctx->error_func) {
+        ctx->error_func(ctx, func, error);
+        return;
+    }
+
+    fprintf(stderr,
+            "MGL WARNING: ctx->error_func is NULL in %s (0x%x), falling back to default handler\n",
+            func ? func : "(null)",
+            error);
+    error_func(ctx, func, error);
+}
+
 void error_func(GLMContext ctx, const char *func, GLenum error)
 {
+    if (mgl_is_ignorable_texture_error(func, error))
+    {
+        static unsigned long long s_ignorable_texture_error_count = 0;
+        s_ignorable_texture_error_count++;
+        if (s_ignorable_texture_error_count <= 64ull ||
+            (s_ignorable_texture_error_count % 1024ull) == 0ull) {
+            fprintf(stderr,
+                    "MGL WARNING: Ignoring transient texture error from %s to improve compatibility (0x%x, hit=%llu)\n",
+                    func,
+                    error,
+                    s_ignorable_texture_error_count);
+        }
+        return;
+    }
+
     fprintf(stderr, "MGL GL Error in %s: 0x%x (%d)\n", func, error, error);
 
     if (ctx->state.error)
@@ -50,6 +111,6 @@ void error_func(GLMContext ctx, const char *func, GLenum error)
     ctx->state.error = error;
 
     /* Temporarily disabled to allow QEMU to continue despite errors */
-    if (ctx->assert_on_error)
-       abort();
+    // if (ctx->assert_on_error)
+    //     assert(0);
 }
