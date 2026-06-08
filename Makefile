@@ -1,12 +1,12 @@
 SHELL := /bin/bash
 $(VERBOSE).SILENT:
 
-SDKPATH := $(THEOS_SDK_PATH)
+SDKPATH := $(shell xcrun --sdk iphoneos --show-sdk-path)
 
 WORKINGDIR       := "build"
 CMAKE_BUILD_TYPE := "release"
-JOBS             := 10
-	
+JOBS             := $(shell sysctl -n hw.ncpu)
+
 build_external:
 	cd external; \
 	./clone_external.sh; \

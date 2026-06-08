@@ -1,8 +1,8 @@
 set -e
-SDKPATH=$THEOS_SDK_PATH
+SDKPATH=`xcrun --sdk iphoneos --show-sdk-path`
 WORKINGDIR="build"
 CMAKE_BUILD_TYPE="release"
-JOBS=10
+JOBS=`sysctl -n hw.ncpu`
 
 cd SPIRV-Tools
 mkdir -p $WORKINGDIR
