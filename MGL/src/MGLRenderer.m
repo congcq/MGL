@@ -28818,7 +28818,8 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
 
     // AGX-safe layer attachment
 #ifdef TARGET_OS_IPHONE
-    [[_view layer] addSublayer:_layer];
+    // on iOS, we don't need to add the CAMetalLayer as a sublayer.
+    // [[_view layer] addSublayer:_layer];
 #else
     if ([_view layer]) {
         [[_view layer] addSublayer: _layer];
