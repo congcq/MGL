@@ -13,7 +13,7 @@ jobs:
         run: |
           brew install make
           wget https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64
-          mv ldid_macosx_arm64 ldid && sudo mv ldid /usr/local/bin
+          mv ldid_macosx_arm64 ldid && chmod +x ldid && sudo mv ldid /usr/local/bin
 
       - name: Checkout repository
         uses: actions/checkout@v4
