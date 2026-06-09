@@ -10,22 +10,19 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Install dependencies
-        run: brew install make
+        run: |
+          brew install make
+          wget https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64
+          mv ldid_macosx_arm64 ldid && sudo mv ldid /usr/bin
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Build
-        run: gmake external build
+        run: gmake build
 
       - name: Upload MGL-Core
         uses: actions/upload-artifact@v4
         with:
           name: libmgl-core
           path: build/libmgl_core.dylib
-
-      - name: Upload MGL-ES
-        uses: actions/upload-artifact@v4
-        with:
-          name: libmgl-es
-          path: build/libmgl_es.dylib
