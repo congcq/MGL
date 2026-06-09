@@ -1,11 +1,16 @@
 SHELL := /bin/bash
 $(VERBOSE).SILENT:
 
-SDKPATH := $(shell xcrun --sdk iphoneos --show-sdk-path)
-
 WORKINGDIR       := "build"
 CMAKE_BUILD_TYPE := "release"
+DETECTPLAT  	 := $(shell uname -s)
+ifeq ($(DETECTPLAT),Linux)
+SDKPATH			 := $(THEOS_SDK_PATH)
+JOBS := $(shell nproc)
+else
+SDKPATH 		 := $(shell xcrun --sdk iphoneos --show-sdk-path)
 JOBS             := $(shell sysctl -n hw.ncpu)
+endif
 
 build_external:
 	cd external; \
@@ -22,13 +27,14 @@ build: build_external
 		-DCMAKE_OSX_SYSROOT=$(SDKPATH) \
 		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
 		-DCMAKE_OSX_ARCHITECTURES=arm64 \
-		-DCMAKE_C_FLAGS="-arch arm64 -isysroot $(SDKPATH) -target arm64-apple-ios14.0 -DTARGET_OS_IPHONE=1" \
-		-DCMAKE_CXX_FLAGS="-arch arm64 -isysroot $(SDKPATH) -target arm64-apple-ios14.0 -DTARGET_OS_IPHONE=1b -stdlib=libc++" \
+		-DCMAKE_C_FLAGS="-arch arm64 -isysroot $(SDKPATH) -target arm64-apple-ios14.0" \
+		-DCMAKE_CXX_FLAGS="-arch arm64 -isysroot $(SDKPATH) -target arm64-apple-ios14.0 -stdlib=libc++" \
 		-DCMAKE_EXE_LINKER_FLAGS="-isysroot $(SDKPATH) -Wl,-syslibroot,$(SDKPATH)" \
 		-DCMAKE_SHARED_LINKER_FLAGS="-isysroot $(SDKPATH) -Wl,-syslibroot,$(SDKPATH)" \
 		..
 
 	cmake --build $(WORKINGDIR) --config $(CMAKE_BUILD_TYPE) -j$(JOBS)
+	ldid -S $(WORKINGDIR)/libmgl_core.dylib
 
 clean:
 	rm -rf build external/*/build

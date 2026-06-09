@@ -19,6 +19,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#include <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 
@@ -15503,7 +15504,11 @@ void mtlInvalidateRenderPass(GLMContext glm_ctx)
         }
 
     #if TARGET_OS_IPHONE
-        CGFloat scale = [UIScreen mainScreen].scale;
+        CGFloat scale = _view.layer.contentsScale; //[UIScreen mainScreen].scale;
+        if (scale <= 0.0)
+        {
+            scale = [UIScreen mainScreen].scale;
+        }
         backingBounds = CGRectMake(bounds.origin.x * scale,
                                 bounds.origin.y * scale,
                                 bounds.size.width * scale,
@@ -28772,7 +28777,7 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     NSLog(@"MGL INFO: PROPER FIX - Creating Metal layer with AGX-safe settings");
 
 #ifdef TARGET_OS_IPHONE
-    _layer = [_view layer];
+    _layer = (CAMetalLayer *)[_view layer];
 #else
     _layer = [[CAMetalLayer alloc] init];
 #endif

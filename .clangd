@@ -2,6 +2,7 @@ CompileFlags:
   Add: [
     "-target", "arm64-apple-ios14.0",
     "-fblocks",
+    "-fobjc-arc",
     
     "-DMGL_GL_CORE",
 
