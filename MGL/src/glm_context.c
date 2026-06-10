@@ -23,7 +23,6 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
-#include <TargetConditionals.h>
 
 #include <stdint.h>
 
@@ -40,7 +39,6 @@
 #include "error.h"
 #include "mgl_safety.h"
 
-extern void getMacOSDefaults(GLMContext glm_ctx);
 extern void getiOSDefaults(GLMContext glm_ctx);
 extern void init_dispatch(GLMContext ctx);
 extern void invalidateTexture(GLMContext ctx, Texture *tex);
@@ -216,12 +214,8 @@ GLMContext createGLMContext(GLenum format, GLenum type,
         ctx->stencil_format.mtl_pixel_format = mtlPixelFormatForGLFormatType(stencil_format, stencil_type);
     }
 
-    // use a CGL context to read guestimates of gl params for installed GPU
-#ifdef TARGET_OS_IPHONE
+    // use ANGLE to read guestimates of gl params for installed GPU because iOS doesn't have OpenGL
     getiOSDefaults(ctx);
-#else
-    getMacOSDefaults(ctx);
-#endif
 
     if (STATE(max_color_attachments) == 0 ||
         STATE(max_color_attachments) > MAX_COLOR_ATTACHMENTS ||

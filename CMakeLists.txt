@@ -64,7 +64,7 @@ set(GLSLANG_LIBS
     ${CMAKE_CURRENT_LIST_DIR}/external/glslang/build/SPIRV/libSPIRV.a
 )
 
-sub_directory(MGL/include/glm)
+add_subdirectory(MGL/include/glm)
 
 add_library(mgl_core SHARED
     ${MGL_C_SOURCES_COMMON}

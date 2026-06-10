@@ -19,7 +19,6 @@
  */
  
 #include <Availability.h>
-#include <TargetConditionals.h>
 
 #include "pixel_utils.h"
 #include "glm_context.h"

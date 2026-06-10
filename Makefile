@@ -19,7 +19,7 @@ build_external:
 
 build: build_external
 	mkdir -p $(WORKINGDIR)
-	cd $(WORKINGDIR) && cmake .. \
+	cd $(WORKINGDIR) && cmake . \
 		-DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
 		-DCMAKE_CROSSCOMPILING=true \
 		-DCMAKE_SYSTEM_NAME=iOS \
