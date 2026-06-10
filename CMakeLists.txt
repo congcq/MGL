@@ -7,12 +7,6 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -target arm64-apple-ios14.0 -fcommon -fobjc-
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -target arm64-apple-ios14.0 -fcommon -fobjc-arc -ObjC -stdlib=libc++")
 set(CMAKE_C_FLAGS_DEBUG "-funwind-tables -g")
 
-if("${CMAKE_HOST_SYSTEM_NAME}" MATCHES "Linux|^GNU$|Android")
-    set(GLOBAL_LDFLAGS "-isysroot ${CMAKE_OSX_SYSROOT} -Wl,-syslibroot,${CMAKE_OSX_SYSROOT} -fuse-ld=lld")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${GLOBAL_LDFLAGS}")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${GLOBAL_LDFLAGS}")
-endif()
-
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -rpath @loader_path -rpath @executable_path")
 
 include_directories(
@@ -40,9 +34,6 @@ set(IOS_FRAMEWORKS
     "-framework Metal"
     "-framework CoreVideo"
     "-framework GameController"
-)
-
-set(ANGLE_FRAMEWORKS
     "-F${CMAKE_CURRENT_LIST_DIR}/external"
     "-framework libEGL"
     "-framework libGLESv2"
@@ -73,6 +64,8 @@ set(GLSLANG_LIBS
     ${CMAKE_CURRENT_LIST_DIR}/external/glslang/build/SPIRV/libSPIRV.a
 )
 
+sub_directory(MGL/include/glm)
+
 add_library(mgl_core SHARED
     ${MGL_C_SOURCES_COMMON}
     ${MGL_M_SOURCES}
@@ -90,8 +83,8 @@ target_compile_definitions(mgl_core PRIVATE
 )
 
 target_link_libraries(mgl_core
+    glm
     ${IOS_FRAMEWORKS}
-    ${ANGLE_FRAMEWORKS}
     ${GLSLANG_LIBS}
     ${SPIRV_CROSS_LIBS}
     ${SPIRV_TOOLS_LIBS}
@@ -121,8 +114,8 @@ target_compile_definitions(mgl_es PRIVATE
 )
 
 target_link_libraries(mgl_es
+    glm
     ${IOS_FRAMEWORKS}
-    ${ANGLE_FRAMEWORKS}
     ${GLSLANG_LIBS}
     ${SPIRV_CROSS_LIBS}
     ${SPIRV_TOOLS_LIBS}
